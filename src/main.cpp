@@ -34,6 +34,26 @@ void splitIntoBlocks(const cv::Mat &image, std::vector<cv::Mat> &blocks)
     // and store them in the blocks vector.
     // The blocks should be of type CV_32F and should be of size 8x8.
     // Keep in mind that if the image size is not divisible into 8x8 blocks, we pad with zeroes for now until I can figure out how to handle that.
+    
+    // Step 1: Pad the image to make it divisible by 8
+    int pad_rows = (image.rows % 8 == 0) ? 0 : (8 - image.rows % 8);
+    int pad_cols = (image.cols % 8 == 0) ? 0 : (8 - image.cols % 8);
+
+    cv::Mat padded_image;
+    cv::copyMakeBorder(image, padded_image, 0, pad_rows, 0, pad_cols, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+    
+    // Convert the block to CV_32F type for DCT processing
+    padded_image.convertTo(padded_image, CV_32FC3);
+
+    // Step 2: Split the padded image into 8x8 blocks
+    for (int row = 0; row < padded_image.rows; row += 8)
+    {
+        for (int col = 0; col < padded_image.cols; col += 8)
+        {
+            cv::Mat block = padded_image(cv::Rect(col, row, 8, 8)).clone(); // Clone to avoid modifying the original image
+            blocks.push_back(block);
+        }
+    }
 }
 
 void processBlock(cv::Mat &block)
@@ -61,6 +81,24 @@ void assembleBlocks(cv::Mat &image, const std::vector<cv::Mat> &blocks, const cv
 {
     // TODO : Implement the function to reassemble the image from the blocks.
     // The image should be of the same size as the original image, hence why we pass the image_size parameter.
+
+    // Step 1: Create an empty image of the same size as the original image
+    image = cv::Mat(image_size, CV_32FC3, cv::Scalar(0, 0, 0)); // Initialize with zeros
+
+    // Step 2: Iterate through the blocks and place them back into the image
+    int index = 0;
+    for (int row = 0; row < image.rows; row += 8)
+    {
+        for (int col = 0; col < image.cols; col += 8)
+        {
+            // Check if the index is within bounds of the blocks vector
+            if (index < blocks.size())
+            {
+                cv::Mat block = blocks[index++];
+                block.copyTo(image(cv::Rect(col, row, 8, 8)));
+            }
+        }
+    }
 }
 
 int main(int argc, char **argv)
@@ -75,7 +113,7 @@ int main(int argc, char **argv)
 
     // Step 2: Convert the image to YCbCr color space
     cv::Mat ycbcr_image;
-    cv::cvtColor(image, ycbcr_image, cv::COLOR_BGR2YCrCb); // OpenCV only has YCrCb, not YCbCr, so I have to keep that in mind when multiplicating using Quantization matrix
+    image.convertTo(ycbcr_image, cv::COLOR_BGR2YCrCb); // OpenCV only has YCrCb, not YCbCr, so I have to keep that in mind when multiplicating using Quantization matrix
 
     // Step 3: Divide the image into 8*8 blocks
     std::vector<cv::Mat> blocks;
@@ -101,7 +139,7 @@ int main(int argc, char **argv)
     cv::imshow("Original Image", image);
     // Convert the reconstructed image back to BGR before displaying
     cv::Mat reconstructed_bgr;
-    cv::cvtColor(reconstructed_image, reconstructed_bgr, cv::COLOR_YCrCb2BGR);
+    reconstructed_image.convertTo(reconstructed_bgr, CV_8UC3);
     cv::imshow("Reconstructed Image", reconstructed_bgr);
     cv::waitKey(0);
     return 0;
