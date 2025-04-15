@@ -3,8 +3,8 @@
 #include <opencv2/opencv.hpp>
 
 using namespace std;
-const string IMAGEPATH = "../../src/images/pexels.png";
-const int quality = 99; // Quality factor for quantization
+const string IMAGEPATH = "../../src/images/slax3.png";
+const int quality = 10; // Quality factor for quantization
 
 // Define the quantization tables for YCbCr color space
 // First the Chrominance Quantization Table, which is used to multiply the CbCr channel of the YCbCr image
@@ -35,7 +35,7 @@ void splitIntoBlocks(const cv::Mat &image, std::vector<cv::Mat> &blocks)
     // and store them in the blocks vector.
     // The blocks should be of type CV_32F and should be of size 8x8.
     // Keep in mind that if the image size is not divisible into 8x8 blocks, we pad with zeroes for now until I can figure out how to handle that.
-    
+
     // Step 1: Pad the image to make it divisible by 8
     int pad_rows = (image.rows % 8 == 0) ? 0 : (8 - image.rows % 8);
     int pad_cols = (image.cols % 8 == 0) ? 0 : (8 - image.cols % 8);
@@ -45,7 +45,7 @@ void splitIntoBlocks(const cv::Mat &image, std::vector<cv::Mat> &blocks)
 
     cout << "Padding image: " << pad_rows << " rows and " << pad_cols << " columns." << endl;
     cout << "Padded image size: " << padded_image.size() << endl;
-    
+
     // Convert the image to CV_32F type for DCT processing
     padded_image.convertTo(padded_image, CV_32FC3);
 
@@ -60,8 +60,24 @@ void splitIntoBlocks(const cv::Mat &image, std::vector<cv::Mat> &blocks)
     }
 }
 
+float determineScale(int quality)
+{
+    // Ensure quality is in valid range
+    if (quality < 1) quality = 1;
+    if (quality > 100) quality = 100;
+    
+    float scale;
+    if (quality < 50) {
+        scale = 50.0f / quality;
+    } else {
+        scale = 2.000001f - (quality * 2.0f / 100.0f);
+    }
+    
+    return scale;
+}
+
 void processBlock(cv::Mat &block, const int quality)
-{    
+{
     // TODO : Implement the function to apply DCT to the block and quantize it using the given quantization matrices.
 
     // Step 1: Split the block into channels
@@ -69,15 +85,7 @@ void processBlock(cv::Mat &block, const int quality)
     cv::split(block, channels); // Split the block into Y, Cr, and Cb channels
 
     // Step 2: Determine the scale factor based on the quality factor
-    float scale;
-    if (quality == 100)
-        scale = 0.01f;
-    else if (quality < 50) {
-        scale = 5000.0f / quality;
-    } else {
-        scale = 200.0f - 2.0f * quality;
-    }
-    scale /= 100.0f;
+    float scale = determineScale(quality);
 
     // Step 3: Apply DCT to each channel separately and quantize
     for (int c = 0; c < 3; ++c)
@@ -111,19 +119,11 @@ void benchmarks(const cv::Mat &block)
 }
 
 void deprocessBlock(cv::Mat &block, const int quality)
-{       
-     // TODO : Implement the function to dequantize the block and apply inverse DCT to reconstruct the image.
+{
+    // TODO : Implement the function to dequantize the block and apply inverse DCT to reconstruct the image.
 
     // Calculate the same scale factor used during quantization
-    float scale;
-    if (quality == 100)
-        scale = 0.01f;
-    else if (quality < 50) {
-        scale = 5000.0f / quality;
-    } else {
-        scale = 200.0f - 2.0f * quality;
-    }
-    scale /= 100.0f;
+    float scale = determineScale(quality);
 
     // Step 1: Split the block into channels
     vector<cv::Mat> channels(3);
@@ -141,7 +141,7 @@ void deprocessBlock(cv::Mat &block, const int quality)
                 channels[c].at<float>(i, j) *= (quantTable * scale); // Apply the same scale factor used in quantization
             }
         }
-        
+
         // Apply inverse DCT
         cv::idct(channels[c], channels[c]);
     }
@@ -151,21 +151,21 @@ void deprocessBlock(cv::Mat &block, const int quality)
 }
 
 void assembleBlocks(cv::Mat &image, const std::vector<cv::Mat> &blocks, const cv::Size &image_size)
-{    
+{
     // TODO : Implement the function to reassemble the image from the blocks.
     // The image should be of the same size as the original image, hence why we pass the image_size parameter.
-    
+
     // Calculate the padded dimensions that were used when splitting
     int padded_height = image_size.height + (image_size.height % 8 == 0 ? 0 : 8 - image_size.height % 8);
     int padded_width = image_size.width + (image_size.width % 8 == 0 ? 0 : 8 - image_size.width % 8);
     cv::Size padded_size(padded_width, padded_height);
-    
+
     cout << "Original image size: " << image_size << endl;
     cout << "Padded image size for reassembly: " << padded_size << endl;
-    
+
     // First create a padded image to match the dimensions used during splitting
     cv::Mat padded_result(padded_size, CV_32FC3, cv::Scalar(0, 0, 0));
-    
+
     // Place blocks into the padded image
     int index = 0;
     for (int row = 0; row < padded_size.height; row += 8)
@@ -178,9 +178,44 @@ void assembleBlocks(cv::Mat &image, const std::vector<cv::Mat> &blocks, const cv
             }
         }
     }
-    
+
     // Now crop the padded result to get the original image size
     image = padded_result(cv::Rect(0, 0, image_size.width, image_size.height)).clone();
+}
+
+void compareImages(const char *originalImagePath, const char *reconstructedImagePath)
+{
+    // Get file sizes
+    FILE *f_orig = fopen(originalImagePath, "rb");
+    FILE *f_recon = fopen(reconstructedImagePath, "rb");
+
+    if (f_orig && f_recon)
+    {
+        // Get original file size
+        fseek(f_orig, 0, SEEK_END);
+        long orig_size = ftell(f_orig);
+
+        // Get reconstructed file size
+        fseek(f_recon, 0, SEEK_END);
+        long recon_size = ftell(f_recon);
+
+        // Close files
+        fclose(f_orig);
+        fclose(f_recon);
+
+        // Calculate compression ratio
+        double compression_ratio = static_cast<double>(orig_size) / recon_size;
+
+        // Print results
+        std::cout << "Original file size: " << orig_size << " bytes" << std::endl;
+        std::cout << "Reconstructed file size: " << recon_size << " bytes" << std::endl;
+        std::cout << "Compression ratio: " << compression_ratio << ":1" << std::endl;
+        std::cout << "Space saving: " << (1.0 - 1.0 / compression_ratio) * 100.0 << "%" << std::endl;
+    }
+    else
+    {
+        std::cerr << "Error opening files for size comparison" << std::endl;
+    }
 }
 
 int main(int argc, char **argv)
@@ -204,15 +239,15 @@ int main(int argc, char **argv)
     splitIntoBlocks(ycbcr_image, blocks);
 
     // Step 4: Apply DCT to each block and quantize it using the given quantization matrix
-    for (auto& block : blocks)
+    for (auto &block : blocks)
         processBlock(block, quality); // 75 is the quality factor for quantization
 
     // Step 5: Perform some calculations that could prove useful later
-    for (auto& block : blocks)
+    for (auto &block : blocks)
         benchmarks(block);
 
     // Step 6: Reverse step 4: Dequantize the blocks and apply inverse DCT to reconstruct the image
-    for (auto& block : blocks)
+    for (auto &block : blocks)
         deprocessBlock(block, quality); // 75 is the quality factor for dequantization
 
     // Step 7: Reassemble the image from the blocks
@@ -232,33 +267,10 @@ int main(int argc, char **argv)
     cv::imwrite("original.jpg", image);
     cv::imwrite("reconstructed.jpg", reconstructed_bgr);
 
-    // Get file sizes
-    FILE* f_orig = fopen("original.jpg", "rb");
-    FILE* f_recon = fopen("reconstructed.jpg", "rb");
+    cout << "Original and reconstructed images saved." << endl;
 
-    if (f_orig && f_recon) {
-        // Get original file size
-        fseek(f_orig, 0, SEEK_END);
-        long orig_size = ftell(f_orig);
-        
-        // Get reconstructed file size
-        fseek(f_recon, 0, SEEK_END);
-        long recon_size = ftell(f_recon);
-        
-        // Close files
-        fclose(f_orig);
-        fclose(f_recon);
-        
-        // Calculate compression ratio
-        double compression_ratio = static_cast<double>(orig_size) / recon_size;
-        
-        // Print results
-        std::cout << "Original file size: " << orig_size << " bytes" << std::endl;
-        std::cout << "Reconstructed file size: " << recon_size << " bytes" << std::endl;
-        std::cout << "Compression ratio: " << compression_ratio << ":1" << std::endl;
-        std::cout << "Space saving: " << (1.0 - 1.0/compression_ratio) * 100.0 << "%" << std::endl;
-    } else {
-        std::cerr << "Error opening files for size comparison" << std::endl;
-    }
+    // Step 8: Perform comparisons
+    compareImages("original.jpg", "reconstructed.jpg");
+    cout << "Comparison completed." << endl;
     return 0;
 }
