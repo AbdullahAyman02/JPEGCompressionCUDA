@@ -455,6 +455,11 @@ int main(int argc, char **argv)
     cudaFree(d_input_blocks);
     cudaFree(d_output_blocks);
 
+    // *****************************************************************************
+    // End CUDA processing
+    // *****************************************************************************
+
+
     // // Step 6: Reverse step 4: Dequantize the blocks and apply inverse DCT to reconstruct the image
     // for (auto &block : blocks)
     //     deprocessBlock(block, quality); // 75 is the quality factor for dequantization

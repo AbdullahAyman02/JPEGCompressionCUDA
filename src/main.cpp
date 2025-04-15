@@ -1,10 +1,11 @@
 #include <iostream>
 #include <vector>
+#include <chrono>
 #include <opencv2/opencv.hpp>
 
 using namespace std;
-const string IMAGEPATH = "../../src/images/slax3.png";
-const int quality = 10; // Quality factor for quantization
+const string IMAGEPATH = "../../src/images/tembo.jpg";
+const int quality = 99; // Quality factor for quantization
 
 // Define the quantization tables for YCbCr color space
 // First the Chrominance Quantization Table, which is used to multiply the CbCr channel of the YCbCr image
@@ -28,6 +29,15 @@ const int LuminanceQuantizationTable[8][8] = {
     {24, 35, 55, 64, 81, 104, 113, 92},
     {49, 64, 78, 87, 103, 121, 120, 101},
     {72, 92, 95, 98, 112, 100, 103, 99}};
+
+
+double measureExecutionTime(std::function<void()> func) {
+    auto start = std::chrono::high_resolution_clock::now();
+    func();
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration = end - start;
+    return duration.count(); // Returns time in milliseconds
+}
 
 void splitIntoBlocks(const cv::Mat &image, std::vector<cv::Mat> &blocks)
 {
@@ -236,23 +246,46 @@ int main(int argc, char **argv)
 
     // Step 3: Divide the image into 8*8 blocks
     std::vector<cv::Mat> blocks;
-    splitIntoBlocks(ycbcr_image, blocks);
+    // Measure splitting time
+    double splitTime = measureExecutionTime([&]() {
+        splitIntoBlocks(ycbcr_image, blocks);
+    });
 
     // Step 4: Apply DCT to each block and quantize it using the given quantization matrix
-    for (auto &block : blocks)
-        processBlock(block, quality); // 75 is the quality factor for quantization
+    // Measure DCT + quantization time
+    double processTime = measureExecutionTime([&]() {
+        for (auto &block : blocks)
+            processBlock(block, quality);
+    });
 
     // Step 5: Perform some calculations that could prove useful later
     for (auto &block : blocks)
         benchmarks(block);
 
     // Step 6: Reverse step 4: Dequantize the blocks and apply inverse DCT to reconstruct the image
-    for (auto &block : blocks)
-        deprocessBlock(block, quality); // 75 is the quality factor for dequantization
+    // Measure IDCT + dequantization time
+    double deprocessTime = measureExecutionTime([&]() {
+        for (auto &block : blocks)
+            deprocessBlock(block, quality);
+    });
 
     // Step 7: Reassemble the image from the blocks
     cv::Mat reconstructed_image;
-    assembleBlocks(reconstructed_image, blocks, image.size());
+    // Measure reassembly time
+    double assembleTime = measureExecutionTime([&]() {
+        assembleBlocks(reconstructed_image, blocks, image.size());
+    });
+
+    // Calculate total time
+    double totalTime = splitTime + processTime + deprocessTime + assembleTime;
+
+    // Print timing results
+    std::cout << "\n===== CPU Timing Results =====\n";
+    std::cout << "Split time: " << splitTime << " ms\n";
+    std::cout << "DCT + Quantization time: " << processTime << " ms\n";
+    std::cout << "IDCT + Dequantization time: " << deprocessTime << " ms\n";
+    std::cout << "Reassembly time: " << assembleTime << " ms\n";
+    std::cout << "Total time: " << totalTime << " ms\n";
 
     // Show the original and reconstructed images
     cv::imshow("Original Image", image);
