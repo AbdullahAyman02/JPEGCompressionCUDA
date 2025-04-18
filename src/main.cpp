@@ -4,8 +4,8 @@
 #include <opencv2/opencv.hpp>
 
 using namespace std;
-const string IMAGEPATH = "../../src/images/tembo.jpg";
-const int quality = 99; // Quality factor for quantization
+const string IMAGEPATH = "../../src/images/Places365_val_00024015_1024x256.png";
+const int quality = 50; // Quality factor for quantization
 
 // Define the quantization tables for YCbCr color space
 // First the Chrominance Quantization Table, which is used to multiply the CbCr channel of the YCbCr image
@@ -30,8 +30,8 @@ const int LuminanceQuantizationTable[8][8] = {
     {49, 64, 78, 87, 103, 121, 120, 101},
     {72, 92, 95, 98, 112, 100, 103, 99}};
 
-
-double measureExecutionTime(std::function<void()> func) {
+double measureExecutionTime(std::function<void()> func)
+{
     auto start = std::chrono::high_resolution_clock::now();
     func();
     auto end = std::chrono::high_resolution_clock::now();
@@ -73,17 +73,106 @@ void splitIntoBlocks(const cv::Mat &image, std::vector<cv::Mat> &blocks)
 float determineScale(int quality)
 {
     // Ensure quality is in valid range
-    if (quality < 1) quality = 1;
-    if (quality > 100) quality = 100;
-    
+    if (quality < 1)
+        quality = 1;
+    if (quality > 100)
+        quality = 100;
+
     float scale;
-    if (quality < 50) {
+    if (quality < 50)
+    {
         scale = 50.0f / quality;
-    } else {
+    }
+    else
+    {
         scale = 2.000001f - (quality * 2.0f / 100.0f);
     }
-    
+
     return scale;
+}
+
+void myDCT(cv::Mat &block)
+{
+    // TODO : Implement the function to apply DCT to the block.
+    // Note: Without using opencv's dct function.
+    // You can use the DCT formula or any other method to compute the DCT.
+    cv::Mat tempBlock = block.clone();
+
+    // `block` will store the discrete cosine transform
+
+    float ci, cj, dct1, sum;
+    int m = 8, n = 8;
+    float pi = 3.14159265358979323846;
+
+    for (int i = 0; i < m; i++)
+    {
+        for (int j = 0; j < n; j++)
+        {
+
+            // ci and cj depends on frequency as well as
+            // number of row and columns of specified matrix
+            if (i == 0)
+                ci = 1 / sqrt(m);
+            else
+                ci = sqrt(2) / sqrt(m);
+            if (j == 0)
+                cj = 1 / sqrt(n);
+            else
+                cj = sqrt(2) / sqrt(n);
+
+            // sum will temporarily store the sum of
+            // cosine signals
+            sum = 0;
+            for (int k = 0; k < m; k++)
+            {
+                for (int l = 0; l < n; l++)
+                {
+                    dct1 = tempBlock.at<float>(k, l) *
+                           cos((2 * k + 1) * i * pi / (2 * m)) *
+                           cos((2 * l + 1) * j * pi / (2 * n));
+                    sum = sum + dct1;
+                }
+            }
+            block.at<float>(i, j) = ci * cj * sum;
+        }
+    }
+}
+
+void myIDCT(cv::Mat &block)
+{
+    cv::Mat tempBlock = block.clone();
+    float ci, cj;
+    float pi = 3.14159265358979323846;
+    int m = 8, n = 8;
+
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            // Calculate the pixel value at position (i,j)
+            float sum = 0.0;
+            
+            for (int k = 0; k < m; k++) {
+                for (int l = 0; l < n; l++) {
+                    // Determine coefficients based on frequency
+                    if (k == 0)
+                        ci = 1 / sqrt(m);
+                    else
+                        ci = sqrt(2) / sqrt(m);
+                    
+                    if (l == 0)
+                        cj = 1 / sqrt(n);
+                    else
+                        cj = sqrt(2) / sqrt(n);
+                    
+                    // Apply IDCT formula
+                    sum += ci * cj * tempBlock.at<float>(k, l) * 
+                           cos((2 * i + 1) * k * pi / (2 * m)) * 
+                           cos((2 * j + 1) * l * pi / (2 * n));
+                }
+            }
+            
+            block.at<float>(i, j) = sum;
+        }
+    }
 }
 
 void processBlock(cv::Mat &block, const int quality)
@@ -100,7 +189,8 @@ void processBlock(cv::Mat &block, const int quality)
     // Step 3: Apply DCT to each channel separately and quantize
     for (int c = 0; c < 3; ++c)
     {
-        cv::dct(channels[c], channels[c]); // Apply DCT to each channel separately
+        // cv::dct(channels[c], channels[c]); // Apply DCT to each channel separately
+        myDCT(channels[c]); // Custom DCT function
 
         // Quantize the DCT coefficients
         for (int i = 0; i < 8; ++i)
@@ -153,7 +243,8 @@ void deprocessBlock(cv::Mat &block, const int quality)
         }
 
         // Apply inverse DCT
-        cv::idct(channels[c], channels[c]);
+        // cv::idct(channels[c], channels[c]);
+        myIDCT(channels[c]); // Custom IDCT function
     }
 
     // Step 3: Merge the channels back
@@ -247,16 +338,15 @@ int main(int argc, char **argv)
     // Step 3: Divide the image into 8*8 blocks
     std::vector<cv::Mat> blocks;
     // Measure splitting time
-    double splitTime = measureExecutionTime([&]() {
-        splitIntoBlocks(ycbcr_image, blocks);
-    });
+    double splitTime = measureExecutionTime([&]()
+                                            { splitIntoBlocks(ycbcr_image, blocks); });
 
     // Step 4: Apply DCT to each block and quantize it using the given quantization matrix
     // Measure DCT + quantization time
-    double processTime = measureExecutionTime([&]() {
+    double processTime = measureExecutionTime([&]()
+                                              {
         for (auto &block : blocks)
-            processBlock(block, quality);
-    });
+            processBlock(block, quality); });
 
     // Step 5: Perform some calculations that could prove useful later
     for (auto &block : blocks)
@@ -264,17 +354,16 @@ int main(int argc, char **argv)
 
     // Step 6: Reverse step 4: Dequantize the blocks and apply inverse DCT to reconstruct the image
     // Measure IDCT + dequantization time
-    double deprocessTime = measureExecutionTime([&]() {
+    double deprocessTime = measureExecutionTime([&]()
+                                                {
         for (auto &block : blocks)
-            deprocessBlock(block, quality);
-    });
+            deprocessBlock(block, quality); });
 
     // Step 7: Reassemble the image from the blocks
     cv::Mat reconstructed_image;
     // Measure reassembly time
-    double assembleTime = measureExecutionTime([&]() {
-        assembleBlocks(reconstructed_image, blocks, image.size());
-    });
+    double assembleTime = measureExecutionTime([&]()
+                                               { assembleBlocks(reconstructed_image, blocks, image.size()); });
 
     // Calculate total time
     double totalTime = splitTime + processTime + deprocessTime + assembleTime;
