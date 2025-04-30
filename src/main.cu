@@ -369,7 +369,11 @@ __global__ void deprocessBlocksKernel(float *d_input_blocks, float *d_output_blo
         
         // Store the reconstructed pixel value in the output
         int outputIndex = blockIndex * 8 * 8 * 3 + ty * 8 * 3 + tx * 3 + c;
-        d_output_blocks[outputIndex] = pixelValue;
+        // Check boundary condition
+        if (outputIndex < 8 * 8 * 3 * gridDim.x) // Ensure we don't go out of bounds
+        {
+            d_output_blocks[outputIndex] = pixelValue;
+        }
     }
 }
 
