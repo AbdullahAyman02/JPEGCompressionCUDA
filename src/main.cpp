@@ -2,9 +2,13 @@
 #include <vector>
 #include <chrono>
 #include <opencv2/opencv.hpp>
+#include <filesystem>
+#include <fstream>
 
 using namespace std;
-const string IMAGEPATH = "../../src/images/Places365_val_00024015_1024x256.png";
+namespace fs = std::filesystem;
+
+const string IMAGEPATH = "../../src/images/slax.jfif";
 const int quality = 50; // Quality factor for quantization
 
 // Define the quantization tables for YCbCr color space
@@ -29,6 +33,32 @@ const int LuminanceQuantizationTable[8][8] = {
     {24, 35, 55, 64, 81, 104, 113, 92},
     {49, 64, 78, 87, 103, 121, 120, 101},
     {72, 92, 95, 98, 112, 100, 103, 99}};
+
+// Precomputed Zigzag scan pattern for 8x8 block
+const int zigzagOrder[64] = {
+    0, 1, 5, 6, 14, 15, 27, 28,
+    2, 4, 7, 13, 16, 26, 29, 42,
+    3, 8, 12, 17, 25, 30, 41, 43,
+    9, 11, 18, 24, 31, 40, 44, 53,
+    10, 19, 23, 32, 39, 45, 52, 54,
+    20, 22, 33, 38, 46, 51, 55, 60,
+    21, 34, 37, 47, 50, 56, 59, 61,
+    35, 36, 48, 49, 57, 58, 62, 63};
+
+// Structure to hold RLE encoded data
+struct RLEPair
+{
+    int16_t run_length;  // 2 bytes
+    int16_t value;       // 2 bytes (quantized coefficients are integers!)
+};
+
+// Structure to hold processed block data
+struct ProcessedBlock
+{
+    std::vector<RLEPair> y_rle;
+    std::vector<RLEPair> cb_rle;
+    std::vector<RLEPair> cr_rle;
+};
 
 double measureExecutionTime(std::function<void()> func)
 {
@@ -70,25 +100,14 @@ void splitIntoBlocks(const cv::Mat &image, std::vector<cv::Mat> &blocks)
     }
 }
 
-float determineScale(int quality)
-{
-    // Ensure quality is in valid range
-    if (quality < 1)
-        quality = 1;
-    if (quality > 100)
-        quality = 100;
-
-    float scale;
-    if (quality < 50)
-    {
-        scale = 50.0f / quality;
+float determineScale(int quality) {
+    quality = std::clamp(quality, 1, 100);
+    
+    if (quality < 50) {
+        return 50.0f / quality; // More aggressive quantization
+    } else {
+        return 2.1f - (quality * 2.0f / 100.0f); // Less quantization
     }
-    else
-    {
-        scale = 2.000001f - (quality * 2.0f / 100.0f);
-    }
-
-    return scale;
 }
 
 void myDCT(cv::Mat &block)
@@ -100,9 +119,9 @@ void myDCT(cv::Mat &block)
 
     // `block` will store the discrete cosine transform
 
-    float ci, cj, dct1, sum;
+    double ci, cj, dct1, sum;
     int m = 8, n = 8;
-    float pi = 3.14159265358979323846;
+    double pi = 3.14159265358979323846;
 
     for (int i = 0; i < m; i++)
     {
@@ -141,38 +160,200 @@ void myDCT(cv::Mat &block)
 void myIDCT(cv::Mat &block)
 {
     cv::Mat tempBlock = block.clone();
-    float ci, cj;
-    float pi = 3.14159265358979323846;
+    double ci, cj;
+    double pi = 3.14159265358979323846;
     int m = 8, n = 8;
 
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
+    for (int i = 0; i < m; i++)
+    {
+        for (int j = 0; j < n; j++)
+        {
             // Calculate the pixel value at position (i,j)
             float sum = 0.0;
-            
-            for (int k = 0; k < m; k++) {
-                for (int l = 0; l < n; l++) {
+
+            for (int k = 0; k < m; k++)
+            {
+                for (int l = 0; l < n; l++)
+                {
                     // Determine coefficients based on frequency
                     if (k == 0)
                         ci = 1 / sqrt(m);
                     else
                         ci = sqrt(2) / sqrt(m);
-                    
+
                     if (l == 0)
                         cj = 1 / sqrt(n);
                     else
                         cj = sqrt(2) / sqrt(n);
-                    
+
                     // Apply IDCT formula
-                    sum += ci * cj * tempBlock.at<float>(k, l) * 
-                           cos((2 * i + 1) * k * pi / (2 * m)) * 
+                    sum += ci * cj * tempBlock.at<float>(k, l) *
+                           cos((2 * i + 1) * k * pi / (2 * m)) *
                            cos((2 * j + 1) * l * pi / (2 * n));
                 }
             }
-            
+
             block.at<float>(i, j) = sum;
         }
     }
+}
+
+// Function to perform zigzag scan on a single channel
+std::vector<int> zigzagScan(const cv::Mat &channel)
+{
+    std::vector<int> zigzag(64);
+    for (int i = 0; i < 64; ++i)
+    {
+        int row = zigzagOrder[i] / 8;
+        int col = zigzagOrder[i] % 8;
+        zigzag[i] = channel.at<float>(row, col);
+    }
+    return zigzag;
+}
+
+// Function to perform inverse zigzag scan
+cv::Mat inverseZigzag(const std::vector<float> &zigzag)
+{
+    cv::Mat channel(8, 8, CV_32F);
+    for (int i = 0; i < 64; ++i)
+    {
+        int row = zigzagOrder[i] / 8;
+        int col = zigzagOrder[i] % 8;
+        channel.at<float>(row, col) = zigzag[i];
+    }
+    return channel;
+}
+
+// RLE encoding for a single channel
+std::vector<RLEPair> rleEncode(const std::vector<int> &zigzag)
+{
+    std::vector<RLEPair> encoded;
+    if (zigzag.empty())
+        return encoded;
+
+    int16_t current = zigzag[0];
+    int16_t count = 1;
+
+    for (size_t i = 1; i < zigzag.size(); ++i)
+    {
+        if (zigzag[i] == current)
+        {
+            count++;
+        }
+        else
+        {
+            encoded.push_back({count, current});
+            current = zigzag[i];
+            count = 1;
+        }
+    }
+    encoded.push_back({count, current});
+
+    return encoded;
+}
+
+// RLE decoding for a single channel
+std::vector<float> rleDecode(const std::vector<RLEPair> &encoded)
+{
+    std::vector<float> decoded;
+    for (const auto &pair : encoded)
+    {
+        decoded.insert(decoded.end(), pair.run_length, pair.value);
+    }
+    return decoded;
+}
+
+ProcessedBlock processBlockWithRLE(cv::Mat &block, const int quality)
+{
+    ProcessedBlock processed;
+
+    // Split channels
+    vector<cv::Mat> channels(3);
+    cv::split(block, channels);
+
+    // Determine scale factor
+    float scale = determineScale(quality);
+
+    // Process each channel
+    for (int c = 0; c < 3; ++c)
+    {
+        // Apply DCT
+        // myDCT(channels[c]);
+        cv::dct(channels[c], channels[c]); // Using OpenCV's DCT for simplicity
+
+        // Quantize
+        for (int i = 0; i < 8; ++i)
+        {
+            for (int j = 0; j < 8; ++j)
+            {
+                int quantTable = (c == 0) ? LuminanceQuantizationTable[i][j]
+                                          : ChrominanceQuantizationTable[i][j];
+                // channels[c].at<float>(i, j) = round(channels[c].at<float>(i, j) / (quantTable * scale));
+                float quant_step = quantTable * scale;
+        
+                // Ensure minimum quantization step of 1
+                if (quant_step < 1.0f) quant_step = 1.0f;
+                
+                channels[c].at<float>(i,j) = round(channels[c].at<float>(i,j) / quant_step);            }
+        }
+
+        // Zigzag scan and RLE encode
+        auto zigzag = zigzagScan(channels[c]);
+        auto rle = rleEncode(zigzag);
+
+        // Store in the appropriate channel
+        if (c == 0)
+            processed.y_rle = rle;
+        else if (c == 1)
+            processed.cb_rle = rle;
+        else
+            processed.cr_rle = rle;
+    }
+
+    return processed;
+}
+
+cv::Mat deprocessBlockWithRLE(const ProcessedBlock &processed, const int quality)
+{
+    cv::Mat block(8, 8, CV_32FC3);
+    vector<cv::Mat> channels(3);
+
+    float scale = determineScale(quality);
+
+    // Process Y channel
+    auto y_decoded = rleDecode(processed.y_rle);
+    channels[0] = inverseZigzag(y_decoded);
+
+    // Process Cb channel
+    auto cb_decoded = rleDecode(processed.cb_rle);
+    channels[1] = inverseZigzag(cb_decoded);
+
+    // Process Cr channel
+    auto cr_decoded = rleDecode(processed.cr_rle);
+    channels[2] = inverseZigzag(cr_decoded);
+
+    // Dequantize and apply IDCT
+    for (int c = 0; c < 3; ++c)
+    {
+        // Dequantize
+        for (int i = 0; i < 8; ++i)
+        {
+            for (int j = 0; j < 8; ++j)
+            {
+                int quantTable = (c == 0) ? LuminanceQuantizationTable[i][j]
+                                          : ChrominanceQuantizationTable[i][j];
+                channels[c].at<float>(i, j) *= (quantTable * scale);
+            }
+        }
+
+        // Apply IDCT
+        // myIDCT(channels[c]);
+        cv::idct(channels[c], channels[c]); // Using OpenCV's IDCT for simplicity
+    }
+
+    // Merge channels
+    cv::merge(channels, block);
+    return block;
 }
 
 void processBlock(cv::Mat &block, const int quality)
@@ -189,8 +370,8 @@ void processBlock(cv::Mat &block, const int quality)
     // Step 3: Apply DCT to each channel separately and quantize
     for (int c = 0; c < 3; ++c)
     {
-        // cv::dct(channels[c], channels[c]); // Apply DCT to each channel separately
-        myDCT(channels[c]); // Custom DCT function
+        cv::dct(channels[c], channels[c]); // Apply DCT to each channel separately
+        // myDCT(channels[c]); // Custom DCT function
 
         // Quantize the DCT coefficients
         for (int i = 0; i < 8; ++i)
@@ -199,8 +380,13 @@ void processBlock(cv::Mat &block, const int quality)
             {
                 // Use the luminance quantization table for the Y channel (0) and the chrominance quantization table for Cb (1) and Cr (2) channels
                 int quantTable = (c == 0) ? LuminanceQuantizationTable[i][j] : ChrominanceQuantizationTable[i][j];
-                channels[c].at<float>(i, j) = round(channels[c].at<float>(i, j) / (quantTable * scale));
-            }
+                // channels[c].at<float>(i, j) = round(channels[c].at<float>(i, j) / (quantTable * scale));
+                float quant_step = quantTable * scale;
+        
+                // Ensure minimum quantization step of 1
+                if (quant_step < 1.0f) quant_step = 1.0f;
+                
+                channels[c].at<float>(i,j) = round(channels[c].at<float>(i,j) / quant_step);            }
         }
     }
 
@@ -243,8 +429,8 @@ void deprocessBlock(cv::Mat &block, const int quality)
         }
 
         // Apply inverse DCT
-        // cv::idct(channels[c], channels[c]);
-        myIDCT(channels[c]); // Custom IDCT function
+        cv::idct(channels[c], channels[c]);
+        // myIDCT(channels[c]); // Custom IDCT function
     }
 
     // Step 3: Merge the channels back
@@ -284,44 +470,91 @@ void assembleBlocks(cv::Mat &image, const std::vector<cv::Mat> &blocks, const cv
     image = padded_result(cv::Rect(0, 0, image_size.width, image_size.height)).clone();
 }
 
-void compareImages(const char *originalImagePath, const char *reconstructedImagePath)
+void saveCompressedData(const string &filename,
+                        const vector<ProcessedBlock> &blocks,
+                        const cv::Size &image_size)
 {
-    // Get file sizes
-    FILE *f_orig = fopen(originalImagePath, "rb");
-    FILE *f_recon = fopen(reconstructedImagePath, "rb");
+    ofstream out(filename, ios::binary);
 
-    if (f_orig && f_recon)
+    // Write image dimensions
+    int width = image_size.width;
+    int height = image_size.height;
+    out.write(reinterpret_cast<const char *>(&width), sizeof(width));
+    out.write(reinterpret_cast<const char *>(&height), sizeof(height));
+
+    // Write number of blocks
+    int num_blocks = blocks.size();
+    out.write(reinterpret_cast<const char *>(&num_blocks), sizeof(num_blocks));
+
+    // Write each block's data
+    for (const auto &block : blocks)
     {
-        // Get original file size
-        fseek(f_orig, 0, SEEK_END);
-        long orig_size = ftell(f_orig);
+        // Write Y channel
+        uint32_t y_size = block.y_rle.size();
+        out.write(reinterpret_cast<const char *>(&y_size), sizeof(y_size));
+        out.write(reinterpret_cast<const char *>(block.y_rle.data()),
+                  y_size * sizeof(RLEPair));
 
-        // Get reconstructed file size
-        fseek(f_recon, 0, SEEK_END);
-        long recon_size = ftell(f_recon);
+        // Write Cb channel
+        uint32_t cb_size = block.cb_rle.size();
+        out.write(reinterpret_cast<const char *>(&cb_size), sizeof(cb_size));
+        out.write(reinterpret_cast<const char *>(block.cb_rle.data()),
+                  cb_size * sizeof(RLEPair));
 
-        // Close files
-        fclose(f_orig);
-        fclose(f_recon);
-
-        // Calculate compression ratio
-        double compression_ratio = static_cast<double>(orig_size) / recon_size;
-
-        // Print results
-        std::cout << "Original file size: " << orig_size << " bytes" << std::endl;
-        std::cout << "Reconstructed file size: " << recon_size << " bytes" << std::endl;
-        std::cout << "Compression ratio: " << compression_ratio << ":1" << std::endl;
-        std::cout << "Space saving: " << (1.0 - 1.0 / compression_ratio) * 100.0 << "%" << std::endl;
+        // Write Cr channel
+        uint32_t cr_size = block.cr_rle.size();
+        out.write(reinterpret_cast<const char *>(&cr_size), sizeof(cr_size));
+        out.write(reinterpret_cast<const char *>(block.cr_rle.data()),
+                  cr_size * sizeof(RLEPair));
     }
-    else
+}
+
+vector<ProcessedBlock> loadCompressedData(const string &filename,
+                                          cv::Size &image_size)
+{
+    ifstream in(filename, ios::binary);
+
+    // Read image dimensions
+    int width, height;
+    in.read(reinterpret_cast<char *>(&width), sizeof(width));
+    in.read(reinterpret_cast<char *>(&height), sizeof(height));
+    image_size = cv::Size(width, height);
+
+    // Read number of blocks
+    int num_blocks;
+    in.read(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
+
+    vector<ProcessedBlock> blocks(num_blocks);
+
+    for (int i = 0; i < num_blocks; ++i)
     {
-        std::cerr << "Error opening files for size comparison" << std::endl;
+        // Read Y channel
+        uint32_t y_size;
+        in.read(reinterpret_cast<char *>(&y_size), sizeof(y_size));
+        blocks[i].y_rle.resize(y_size);
+        in.read(reinterpret_cast<char *>(blocks[i].y_rle.data()),
+                y_size * sizeof(RLEPair));
+
+        // Read Cb channel
+        uint32_t cb_size;
+        in.read(reinterpret_cast<char *>(&cb_size), sizeof(cb_size));
+        blocks[i].cb_rle.resize(cb_size);
+        in.read(reinterpret_cast<char *>(blocks[i].cb_rle.data()),
+                cb_size * sizeof(RLEPair));
+
+        // Read Cr channel
+        uint32_t cr_size;
+        in.read(reinterpret_cast<char *>(&cr_size), sizeof(cr_size));
+        blocks[i].cr_rle.resize(cr_size);
+        in.read(reinterpret_cast<char *>(blocks[i].cr_rle.data()),
+                cr_size * sizeof(RLEPair));
     }
+
+    return blocks;
 }
 
 int main(int argc, char **argv)
 {
-    // Step 1: Read the image in RGB format
     cv::Mat image = cv::imread(IMAGEPATH, cv::IMREAD_COLOR);
     if (image.empty())
     {
@@ -331,35 +564,43 @@ int main(int argc, char **argv)
     cout << "Image size: " << image.size() << endl;
     cout << "Image type: " << image.type() << endl;
 
-    // Step 2: Convert the image to YCbCr color space
     cv::Mat ycbcr_image;
     cv::cvtColor(image, ycbcr_image, cv::COLOR_BGR2YCrCb);
 
-    // Step 3: Divide the image into 8*8 blocks
     std::vector<cv::Mat> blocks;
-    // Measure splitting time
     double splitTime = measureExecutionTime([&]()
                                             { splitIntoBlocks(ycbcr_image, blocks); });
 
-    // Step 4: Apply DCT to each block and quantize it using the given quantization matrix
-    // Measure DCT + quantization time
+    // ================== COMPRESSION PHASE ==================
+    // Process blocks with RLE
+    vector<ProcessedBlock> processedBlocks;
     double processTime = measureExecutionTime([&]()
                                               {
-        for (auto &block : blocks)
-            processBlock(block, quality); });
+        for (auto &block : blocks) {
+            processedBlocks.push_back(processBlockWithRLE(block, quality));
+        } });
 
-    // Step 5: Perform some calculations that could prove useful later
-    for (auto &block : blocks)
-        benchmarks(block);
+    // Save compressed data
+    blocks.clear();
+    const string compressed_filename = "compressed.shattah";
+    saveCompressedData(compressed_filename, processedBlocks, image.size());
+    
+    // Get original file size
+    uintmax_t original_raw_size = image.total() * image.elemSize(); 
+    uintmax_t compressed_size = fs::file_size(compressed_filename);
 
-    // Step 6: Reverse step 4: Dequantize the blocks and apply inverse DCT to reconstruct the image
-    // Measure IDCT + dequantization time
-    double deprocessTime = measureExecutionTime([&]()
-                                                {
-        for (auto &block : blocks)
-            deprocessBlock(block, quality); });
+    // ================== DECOMPRESSION PHASE ==================
+    // Load compressed data
+    cv::Size loaded_size;
+    auto loadedBlocks = loadCompressedData(compressed_filename, loaded_size);
+    
+    // Reconstruct blocks from RLE
+    double deprocessTime = measureExecutionTime([&]() {
+        for (const auto &processed : loadedBlocks) {
+            blocks.push_back(deprocessBlockWithRLE(processed, quality));
+        }
+    });
 
-    // Step 7: Reassemble the image from the blocks
     cv::Mat reconstructed_image;
     // Measure reassembly time
     double assembleTime = measureExecutionTime([&]()
@@ -371,8 +612,8 @@ int main(int argc, char **argv)
     // Print timing results
     std::cout << "\n===== CPU Timing Results =====\n";
     std::cout << "Split time: " << splitTime << " ms\n";
-    std::cout << "DCT + Quantization time: " << processTime << " ms\n";
-    std::cout << "IDCT + Dequantization time: " << deprocessTime << " ms\n";
+    std::cout << "DCT + Quantization + RLE time: " << processTime << " ms\n";
+    std::cout << "IDCT + Dequantization + RLD time: " << deprocessTime << " ms\n";
     std::cout << "Reassembly time: " << assembleTime << " ms\n";
     std::cout << "Total time: " << totalTime << " ms\n";
 
@@ -385,14 +626,15 @@ int main(int argc, char **argv)
     cv::imshow("Reconstructed Image", reconstructed_bgr);
     cv::waitKey(0);
 
-    // Save both images to disk
-    cv::imwrite("original.jpg", image);
-    cv::imwrite("reconstructed.jpg", reconstructed_bgr);
+    // ================== COMPRESSION METRICS ==================
+    cout << "\n===== Compression Results =====" << endl;
+    cout << "Original size: " << original_raw_size << " bytes" << endl;
+    cout << "Compressed size: " << compressed_size << " bytes" << endl;
+    cout << "Compression ratio: " 
+         << fixed << setprecision(2) 
+         << (double)original_raw_size/compressed_size << ":1" << endl;
+    cout << "Space saving: " 
+         << (1.0 - (double)compressed_size/original_raw_size)*100.0 << "%" << endl;
 
-    cout << "Original and reconstructed images saved." << endl;
-
-    // Step 8: Perform comparisons
-    compareImages("original.jpg", "reconstructed.jpg");
-    cout << "Comparison completed." << endl;
     return 0;
 }
