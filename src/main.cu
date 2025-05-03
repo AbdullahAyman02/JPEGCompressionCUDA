@@ -1,27 +1,70 @@
+%%writefile 1200488.cu
 #include <iostream>
 #include <vector>
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <cassert>
 #include <opencv2/opencv.hpp>
+#include <cooperative_groups.h>
+#include <chrono>
+#include <sys/stat.h>
+#include <fstream>
 
 using namespace std;
+using namespace cooperative_groups;
+namespace cg = cooperative_groups;
 
-// Define the quantization tables for YCbCr color space
-// First the Chrominance Quantization Table, which is used to multiply the CbCr channel of the YCbCr image
-__constant__ int ChrominanceQuantizationTable[8][8];
-int h_ChromTable[8][8] = {
-    {17, 18, 24, 47, 99, 99, 99, 99},
-    {18, 21, 26, 66, 99, 99, 99, 99},
-    {24, 26, 56, 99, 99, 99, 99, 99},
-    {47, 66, 99, 99, 99, 99, 99, 99},
-    {99, 99, 99, 99, 99, 99, 99, 99},
-    {99, 99, 99, 99, 99, 99, 99, 99},
-    {99, 99, 99, 99, 99, 99, 99, 99},
-    {99, 99, 99, 99, 99, 99, 99, 99}};
+// GPU Constants
+__constant__ int d_LuminanceQuantTable[8][8];
+__constant__ int d_ChrominanceQuantTable[8][8];
+__constant__ float d_dctMatrix[8][8];
+__constant__ float d_idctMatrix[8][8];
+__constant__ int d_zigzagOrder[64];
 
-// Then the Luminance Quantization Table, which is used to multiply the Y channel of the YCbCr image
-__constant__ int LuminanceQuantizationTable[8][8];
-int h_LumTable[8][8] = {
+// Compression Structures
+struct GPURLEBlock
+{
+    int y_size, cb_size, cr_size;
+    int16_t *y_data;
+    int16_t *cb_data;
+    int16_t *cr_data;
+};
+
+struct GPUCompressedData
+{
+    int width, height;
+    int num_blocks;
+    GPURLEBlock *blocks;
+};
+
+// Timing utilities
+class GPUTimer
+{
+    cudaEvent_t start, stop;
+
+public:
+    GPUTimer()
+    {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+    }
+    ~GPUTimer()
+    {
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+    void record(cudaEvent_t event) { cudaEventRecord(event); }
+    float elapsed(cudaEvent_t start, cudaEvent_t stop)
+    {
+        float ms;
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        return ms;
+    }
+};
+
+// Host Quantization Tables and DCT Matrices
+static const int h_LumTable[8][8] = {
     {16, 11, 10, 16, 24, 40, 51, 61},
     {12, 12, 14, 19, 26, 58, 60, 55},
     {14, 13, 16, 24, 40, 57, 69, 56},
@@ -31,348 +74,499 @@ int h_LumTable[8][8] = {
     {49, 64, 78, 87, 103, 121, 120, 101},
     {72, 92, 95, 98, 112, 100, 103, 99}};
 
-// DCT matrix T obtained from matlab dctmtx(8)
-__constant__ float dctMatrix[8][8];
-float h_dctMatrix[8][8] = {
-    {0.3536, 0.3536, 0.3536, 0.3536, 0.3536, 0.3536, 0.3536, 0.3536},
-    {0.4904, 0.4157, 0.2778, 0.0975, -0.0975, -0.2778, -0.4157, -0.4904},
-    {0.4619, 0.1913, -0.1913, -0.4619, -0.4619, -0.1913, 0.1913, 0.4619},
-    {0.4157, -0.0975, -0.4904, -0.2778, 0.2778, 0.4904, 0.0975, -0.4157},
-    {0.3536, -0.3536, -0.3536, 0.3536, 0.3536, -0.3536, -0.3536, 0.3536},
-    {0.2778, -0.4904, 0.0975, 0.4157, -0.4157, -0.0975, 0.4904, -0.2778},
-    {0.1913, -0.4619, 0.4619, -0.1913, -0.1913, 0.4619, -0.4619, 0.1913},
-    {0.0975, -0.2778, 0.4157, -0.4904, 0.4904, -0.4157, 0.2778, -0.0975}};
+static const int h_ChromTable[8][8] = {
+    {17, 18, 24, 47, 99, 99, 99, 99},
+    {18, 21, 26, 66, 99, 99, 99, 99},
+    {24, 26, 56, 99, 99, 99, 99, 99},
+    {47, 66, 99, 99, 99, 99, 99, 99},
+    {99, 99, 99, 99, 99, 99, 99, 99},
+    {99, 99, 99, 99, 99, 99, 99, 99},
+    {99, 99, 99, 99, 99, 99, 99, 99},
+    {99, 99, 99, 99, 99, 99, 99, 99}};
 
-// transposed DCT matrix T' obtained from matlab dctmtx(8) with a transpose
-__constant__ float idctMatrix[8][8];
-float h_idctMatrix[8][8] = {
-    {0.3536, 0.4904, 0.4619, 0.4157, 0.3536, 0.2778, 0.1913, 0.0975},
-    {0.3536, 0.4157, 0.1913, -0.0975, -0.3536, -0.4904, -0.4619, -0.2778},
-    {0.3536, 0.2778, -0.1913, -0.4904, -0.3536, 0.0975, 0.4619, 0.4157},
-    {0.3536, 0.0975, -0.4619, -0.2778, 0.3536, 0.4157, -0.1913, -0.4904},
-    {0.3536, -0.0975, -0.4619, 0.2778, 0.3536, -0.4157, -0.1913, 0.4904},
-    {0.3536, -0.2778, -0.1913, 0.4904, -0.3536, -0.0975, 0.4619, -0.4157},
-    {0.3536, -0.4157, 0.1913, 0.0975, -0.3536, 0.4904, -0.4619, 0.2778},
-    {0.3536, -0.4904, 0.4619, -0.4157, 0.3536, -0.2778, 0.1913, -0.0975}};
+static const float h_dctMatrix[8][8] = {
+    {0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f},
+    {0.49039264f, 0.41573481f, 0.27778512f, 0.09754516f, -0.09754516f, -0.27778512f, -0.41573481f, -0.49039264f},
+    {0.46193975f, 0.19134172f, -0.19134172f, -0.46193975f, -0.46193975f, -0.19134172f, 0.19134172f, 0.46193975f},
+    {0.41573481f, -0.09754516f, -0.49039264f, -0.27778512f, 0.27778512f, 0.49039264f, 0.09754516f, -0.41573481f},
+    {0.35355338f, -0.35355338f, -0.35355338f, 0.35355338f, 0.35355338f, -0.35355338f, -0.35355338f, 0.35355338f},
+    {0.27778512f, -0.49039264f, 0.09754516f, 0.41573481f, -0.41573481f, -0.09754516f, 0.49039264f, -0.27778512f},
+    {0.19134172f, -0.46193975f, 0.46193975f, -0.19134172f, -0.19134172f, 0.46193975f, -0.46193975f, 0.19134172f},
+    {0.09754516f, -0.27778512f, 0.41573481f, -0.49039264f, 0.49039264f, -0.41573481f, 0.27778512f, -0.09754516f}};
 
-__host__ __device__ float determineScale(int quality)
-{
-    // Ensure quality is in valid range
-    if (quality < 1)
-        quality = 1;
-    if (quality > 100)
-        quality = 100;
+static const float h_idctMatrix[8][8] = {
+    {0.35355338f, 0.49039264f, 0.46193975f, 0.41573481f, 0.35355338f, 0.27778512f, 0.19134172f, 0.09754516f},
+    {0.35355338f, 0.41573481f, 0.19134172f, -0.09754516f, -0.35355338f, -0.49039264f, -0.46193975f, -0.27778512f},
+    {0.35355338f, 0.27778512f, -0.19134172f, -0.49039264f, -0.35355338f, 0.09754516f, 0.46193975f, 0.41573481f},
+    {0.35355338f, 0.09754516f, -0.46193975f, -0.27778512f, 0.35355338f, 0.41573481f, -0.19134172f, -0.49039264f},
+    {0.35355338f, -0.09754516f, -0.46193975f, 0.27778512f, 0.35355338f, -0.41573481f, -0.19134172f, 0.49039264f},
+    {0.35355338f, -0.27778512f, -0.19134172f, 0.49039264f, -0.35355338f, -0.09754516f, 0.46193975f, -0.41573481f},
+    {0.35355338f, -0.41573481f, 0.19134172f, 0.09754516f, -0.35355338f, 0.49039264f, -0.46193975f, 0.27778512f},
+    {0.35355338f, -0.49039264f, 0.46193975f, -0.41573481f, 0.35355338f, -0.27778512f, 0.19134172f, -0.09754516f}};
 
-    float scale;
-    if (quality < 50)
-    {
-        scale = 50.0f / quality;
-    }
-    else
-    {
-        scale = 2.000001f - (quality * 2.0f / 100.0f);
-    }
+static const int zigzagOrder[64] = {
+    0, 1, 5, 6, 14, 15, 27, 28,
+    2, 4, 7, 13, 16, 26, 29, 42,
+    3, 8, 12, 17, 25, 30, 41, 43,
+    9, 11, 18, 24, 31, 40, 44, 53,
+    10, 19, 23, 32, 39, 45, 52, 54,
+    20, 22, 33, 38, 46, 51, 55, 60,
+    21, 34, 37, 47, 50, 56, 59, 61,
+    35, 36, 48, 49, 57, 58, 62, 63};
 
-    return scale;
-}
-
-#define gpuErrchk(ans)                        \
-    {                                         \
-        gpuAssert((ans), __FILE__, __LINE__); \
-    }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true)
-{
-    if (code != cudaSuccess)
-    {
-        std::cerr << "GPUassert: " << cudaGetErrorString(code) << " " << file << " " << line << std::endl;
-        if (abort)
-            exit(code);
+// GPU Kernels
+__device__ float determineScale(int quality) {
+    quality = max(1, min(quality, 100)); // Clamp quality to [1, 100]
+    
+    if (quality < 50) {
+        return 50.0f / quality; // More aggressive quantization
+    } else {
+        return 2.1f - (quality * 2.0f / 100.0f); // Less quantization
     }
 }
 
-__host__ void splitIntoBlocks(const cv::Mat &image, std::vector<cv::Mat> &blocks)
+__device__ void zigzagScan(const int16_t *channel, int16_t *output)
 {
-    // TODO : Implement the function to split the image into 8x8 blocks
-    // and store them in the blocks vector.
-    // The blocks should be of type CV_32F and should be of size 8x8.
-    // Keep in mind that if the image size is not divisible into 8x8 blocks, we pad with zeroes for now until I can figure out how to handle that.
-
-    // Step 1: Pad the image to make it divisible by 8
-    int pad_rows = (image.rows % 8 == 0) ? 0 : (8 - image.rows % 8);
-    int pad_cols = (image.cols % 8 == 0) ? 0 : (8 - image.cols % 8);
-
-    cv::Mat padded_image;
-    cv::copyMakeBorder(image, padded_image, 0, pad_rows, 0, pad_cols, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-
-    cout << "Padding image: " << pad_rows << " rows and " << pad_cols << " columns." << endl;
-    cout << "Padded image size: " << padded_image.size() << endl;
-
-    // Convert the image to CV_32F type for DCT processing
-    padded_image.convertTo(padded_image, CV_32FC3);
-
-    // Step 2: Split the padded image into 8x8 blocks
-    for (int row = 0; row < padded_image.rows; row += 8)
+    for (int i = 0; i < 64; i++)
     {
-        for (int col = 0; col < padded_image.cols; col += 8)
+        int row = d_zigzagOrder[i] / 8;
+        int col = d_zigzagOrder[i] % 8;
+        output[i] = channel[row * 8 + col];
+    }
+}
+
+__device__ void rleEncode(const int16_t *zigzag, int16_t *output, int &size)
+{
+    int16_t current = zigzag[0];
+    int count = 1;
+    size = 0;
+
+    for (int i = 1; i < 64; i++)
+    {
+        if (zigzag[i] == current)
         {
-            cv::Mat block = padded_image(cv::Rect(col, row, 8, 8)).clone(); // Clone to avoid modifying the original image
+            count++;
+        }
+        else
+        {
+            output[size++] = count;
+            output[size++] = current;
+            current = zigzag[i];
+            count = 1;
+        }
+    }
+    output[size++] = count;
+    output[size++] = current;
+}
+
+__global__ void gpuCompressKernel(float *input, GPUCompressedData output, int quality)
+{
+    cg::thread_block tile = cg::this_thread_block();
+    __shared__ float smem[8][8][3];
+    __shared__ int16_t dct_coeffs[8][8];
+    __shared__ int16_t zigzag[64];
+    __shared__ int16_t rle_buffer[128];
+
+    int block_idx = blockIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // Load block data
+    for (int c = 0; c < 3; c++)
+    {
+        int idx = block_idx * 192 + ty * 24 + tx * 3 + c;
+        smem[ty][tx][c] = input[idx];
+    }
+    tile.sync();
+
+    float scale = determineScale(quality);
+
+    if (tile.thread_rank() == 0)
+    {
+        // Process Y channel (0)
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 8; k++)
+                {
+                    for (int l = 0; l < 8; l++)
+                    {
+                        sum += d_dctMatrix[i][k] * smem[k][l][0] * d_idctMatrix[l][j];
+                    }
+                }
+                dct_coeffs[i][j] = static_cast<int16_t>(round(sum));
+            }
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float quant_step = d_LuminanceQuantTable[i][j] * scale;
+                if (quant_step < 1.0f) quant_step = 1.0f;  // Add this line
+                dct_coeffs[i][j] = static_cast<int16_t>(round(dct_coeffs[i][j] / quant_step));
+            }
+        }
+        zigzagScan(&dct_coeffs[0][0], zigzag);
+        rleEncode(zigzag, rle_buffer, output.blocks[block_idx].y_size);
+        for (int i = 0; i < output.blocks[block_idx].y_size; i++)
+        {
+            output.blocks[block_idx].y_data[i] = rle_buffer[i];
+        }
+
+        // Process Cb channel (1)
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 8; k++)
+                {
+                    for (int l = 0; l < 8; l++)
+                    {
+                        sum += d_dctMatrix[i][k] * smem[k][l][1] * d_idctMatrix[l][j];
+                    }
+                }
+                dct_coeffs[i][j] = static_cast<int16_t>(round(sum));
+            }
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float quant_step = d_ChrominanceQuantTable[i][j] * scale;
+                if (quant_step < 1.0f) quant_step = 1.0f;  // Add this line
+                dct_coeffs[i][j] = static_cast<int16_t>(round(dct_coeffs[i][j] / quant_step));
+            }
+        }
+        zigzagScan(&dct_coeffs[0][0], zigzag);
+        rleEncode(zigzag, rle_buffer, output.blocks[block_idx].cb_size);
+        for (int i = 0; i < output.blocks[block_idx].cb_size; i++)
+        {
+            output.blocks[block_idx].cb_data[i] = rle_buffer[i];
+        }
+
+        // Process Cr channel (2)
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 8; k++)
+                {
+                    for (int l = 0; l < 8; l++)
+                    {
+                        sum += d_dctMatrix[i][k] * smem[k][l][2] * d_idctMatrix[l][j];
+                    }
+                }
+                dct_coeffs[i][j] = static_cast<int16_t>(round(sum));
+            }
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float quant_step = d_ChrominanceQuantTable[i][j] * scale;
+                if (quant_step < 1.0f) quant_step = 1.0f;  // Add this line
+                dct_coeffs[i][j] = static_cast<int16_t>(round(dct_coeffs[i][j] / quant_step));
+            }
+        }
+        zigzagScan(&dct_coeffs[0][0], zigzag);
+        rleEncode(zigzag, rle_buffer, output.blocks[block_idx].cr_size);
+        for (int i = 0; i < output.blocks[block_idx].cr_size; i++)
+        {
+            output.blocks[block_idx].cr_data[i] = rle_buffer[i];
+        }
+    }
+    tile.sync();
+}
+
+__global__ void gpuDecompressKernel(float *output, GPUCompressedData input, int quality)
+{
+    cg::thread_block tile = cg::this_thread_block();
+    __shared__ float smem[8][8][3];
+    __shared__ int16_t zigzag[64];
+    __shared__ float dct_coeffs[8][8];
+
+    int block_idx = blockIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    if (tile.thread_rank() == 0)
+    {
+        // Process Y channel
+        int idx = 0;
+        for (int i = 0; i < input.blocks[block_idx].y_size; i += 2)
+        {
+            int count = input.blocks[block_idx].y_data[i];
+            int16_t value = input.blocks[block_idx].y_data[i + 1];
+            while (count--)
+                zigzag[idx++] = value;
+        }
+        for (int i = 0; i < 64; i++)
+        {
+            int row = d_zigzagOrder[i] / 8;
+            int col = d_zigzagOrder[i] % 8;
+            dct_coeffs[row][col] = zigzag[i];
+        }
+        float scale = determineScale(quality);
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float quant_step = d_LuminanceQuantTable[i][j] * scale;
+                dct_coeffs[i][j] *= quant_step;
+            }
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 8; k++)
+                {
+                    for (int l = 0; l < 8; l++)
+                    {
+                        sum += d_idctMatrix[i][k] * dct_coeffs[k][l] * d_dctMatrix[l][j];
+                    }
+                }
+                smem[i][j][0] = sum;
+            }
+        }
+
+        // Process Cb channel
+        idx = 0;
+        for (int i = 0; i < input.blocks[block_idx].cb_size; i += 2)
+        {
+            int count = input.blocks[block_idx].cb_data[i];
+            int16_t value = input.blocks[block_idx].cb_data[i + 1];
+            while (count--)
+                zigzag[idx++] = value;
+        }
+        for (int i = 0; i < 64; i++)
+        {
+            int row = d_zigzagOrder[i] / 8;
+            int col = d_zigzagOrder[i] % 8;
+            dct_coeffs[row][col] = zigzag[i];
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float quant_step = d_ChrominanceQuantTable[i][j] * scale;
+                dct_coeffs[i][j] *= quant_step;
+            }
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 8; k++)
+                {
+                    for (int l = 0; l < 8; l++)
+                    {
+                        sum += d_idctMatrix[i][k] * dct_coeffs[k][l] * d_dctMatrix[l][j];
+                    }
+                }
+                smem[i][j][1] = sum;
+            }
+        }
+
+        // Process Cr channel
+        idx = 0;
+        for (int i = 0; i < input.blocks[block_idx].cr_size; i += 2)
+        {
+            int count = input.blocks[block_idx].cr_data[i];
+            int16_t value = input.blocks[block_idx].cr_data[i + 1];
+            while (count--)
+                zigzag[idx++] = value;
+        }
+        for (int i = 0; i < 64; i++)
+        {
+            int row = d_zigzagOrder[i] / 8;
+            int col = d_zigzagOrder[i] % 8;
+            dct_coeffs[row][col] = zigzag[i];
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float quant_step = d_ChrominanceQuantTable[i][j] * scale;
+                dct_coeffs[i][j] *= quant_step;
+            }
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            for (int j = 0; j < 8; j++)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 8; k++)
+                {
+                    for (int l = 0; l < 8; l++)
+                    {
+                        sum += d_idctMatrix[i][k] * dct_coeffs[k][l] * d_dctMatrix[l][j];
+                    }
+                }
+                smem[i][j][2] = sum;
+            }
+        }
+    }
+    tile.sync();
+
+    for (int c = 0; c < 3; c++)
+    {
+        int idx = block_idx * 192 + ty * 24 + tx * 3 + c;
+        output[idx] = smem[ty][tx][c];
+    }
+}
+
+// Host functions
+void initializeGPUConstants()
+{
+    cudaMemcpyToSymbol(d_LuminanceQuantTable, h_LumTable, sizeof(h_LumTable));
+    cudaMemcpyToSymbol(d_ChrominanceQuantTable, h_ChromTable, sizeof(h_ChromTable));
+    cudaMemcpyToSymbol(d_dctMatrix, h_dctMatrix, sizeof(h_dctMatrix));
+    cudaMemcpyToSymbol(d_idctMatrix, h_idctMatrix, sizeof(h_idctMatrix));
+    cudaMemcpyToSymbol(d_zigzagOrder, zigzagOrder, sizeof(zigzagOrder));
+}
+
+size_t getFileSize(const string &filename)
+{
+    struct stat stat_buf;
+    int rc = stat(filename.c_str(), &stat_buf);
+    return rc == 0 ? stat_buf.st_size : 0;
+}
+
+void saveCompressedData(const GPUCompressedData &data, const string &filename)
+{
+    ofstream file(filename, ios::binary);
+    int width = data.width;
+    int height = data.height;
+    int num_blocks = data.num_blocks;
+
+    file.write(reinterpret_cast<const char *>(&width), sizeof(int));
+    file.write(reinterpret_cast<const char *>(&height), sizeof(int));
+    file.write(reinterpret_cast<const char *>(&num_blocks), sizeof(int));
+
+    GPURLEBlock *h_blocks = new GPURLEBlock[num_blocks];
+    cudaMemcpy(h_blocks, data.blocks, num_blocks * sizeof(GPURLEBlock), cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < num_blocks; i++)
+    {
+        GPURLEBlock &block = h_blocks[i];
+        int16_t *h_y_data = new int16_t[block.y_size];
+        int16_t *h_cb_data = new int16_t[block.cb_size];
+        int16_t *h_cr_data = new int16_t[block.cr_size];
+
+        cudaMemcpy(h_y_data, block.y_data, block.y_size * sizeof(int16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_cb_data, block.cb_data, block.cb_size * sizeof(int16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_cr_data, block.cr_data, block.cr_size * sizeof(int16_t), cudaMemcpyDeviceToHost);
+
+        file.write(reinterpret_cast<const char *>(&block.y_size), sizeof(int));
+        file.write(reinterpret_cast<const char *>(h_y_data), block.y_size * sizeof(int16_t));
+        file.write(reinterpret_cast<const char *>(&block.cb_size), sizeof(int));
+        file.write(reinterpret_cast<const char *>(h_cb_data), block.cb_size * sizeof(int16_t));
+        file.write(reinterpret_cast<const char *>(&block.cr_size), sizeof(int));
+        file.write(reinterpret_cast<const char *>(h_cr_data), block.cr_size * sizeof(int16_t));
+
+        delete[] h_y_data;
+        delete[] h_cb_data;
+        delete[] h_cr_data;
+    }
+    delete[] h_blocks;
+}
+
+GPUCompressedData loadCompressedData(const string &filename)
+{
+    ifstream file(filename, ios::binary);
+    GPUCompressedData data;
+
+    file.read(reinterpret_cast<char *>(&data.width), sizeof(int));
+    file.read(reinterpret_cast<char *>(&data.height), sizeof(int));
+    file.read(reinterpret_cast<char *>(&data.num_blocks), sizeof(int));
+
+    cudaMalloc(&data.blocks, data.num_blocks * sizeof(GPURLEBlock));
+    GPURLEBlock *h_blocks = new GPURLEBlock[data.num_blocks];
+
+    for (int i = 0; i < data.num_blocks; i++)
+    {
+        GPURLEBlock block;
+        file.read(reinterpret_cast<char *>(&block.y_size), sizeof(int));
+        file.read(reinterpret_cast<char *>(&block.cb_size), sizeof(int));
+        file.read(reinterpret_cast<char *>(&block.cr_size), sizeof(int));
+
+        int16_t *h_y_data = new int16_t[block.y_size];
+        int16_t *h_cb_data = new int16_t[block.cb_size];
+        int16_t *h_cr_data = new int16_t[block.cr_size];
+
+        file.read(reinterpret_cast<char *>(h_y_data), block.y_size * sizeof(int16_t));
+        file.read(reinterpret_cast<char *>(h_cb_data), block.cb_size * sizeof(int16_t));
+        file.read(reinterpret_cast<char *>(h_cr_data), block.cr_size * sizeof(int16_t));
+
+        cudaMalloc(&block.y_data, block.y_size * sizeof(int16_t));
+        cudaMalloc(&block.cb_data, block.cb_size * sizeof(int16_t));
+        cudaMalloc(&block.cr_data, block.cr_size * sizeof(int16_t));
+
+        cudaMemcpy(block.y_data, h_y_data, block.y_size * sizeof(int16_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(block.cb_data, h_cb_data, block.cb_size * sizeof(int16_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(block.cr_data, h_cr_data, block.cr_size * sizeof(int16_t), cudaMemcpyHostToDevice);
+
+        delete[] h_y_data;
+        delete[] h_cb_data;
+        delete[] h_cr_data;
+
+        h_blocks[i] = block;
+    }
+    cudaMemcpy(data.blocks, h_blocks, data.num_blocks * sizeof(GPURLEBlock), cudaMemcpyHostToDevice);
+    delete[] h_blocks;
+    return data;
+}
+
+void splitIntoBlocks(const cv::Mat &image, vector<cv::Mat> &blocks)
+{
+    int blockSize = 8;
+    int width = image.cols;
+    int height = image.rows;
+
+    for (int y = 0; y < height; y += blockSize)
+    {
+        for (int x = 0; x < width; x += blockSize)
+        {
+            cv::Rect roi(x, y, blockSize, blockSize);
+            if (roi.x + roi.width > width)
+                roi.width = width - roi.x;
+            if (roi.y + roi.height > height)
+                roi.height = height - roi.y;
+            cv::Mat block = image(roi).clone();
+            if (block.rows < blockSize || block.cols < blockSize)
+            {
+                cv::copyMakeBorder(block, block, 0, blockSize - block.rows, 0, blockSize - block.cols, cv::BORDER_CONSTANT, cv::Scalar(0));
+            }
             blocks.push_back(block);
         }
     }
 }
 
-__host__ void processBlock(cv::Mat &block, const int quality)
+void assembleBlocks(cv::Mat &image, const vector<cv::Mat> &blocks, cv::Size imageSize)
 {
-    // TODO : Implement the function to apply DCT to the block and quantize it using the given quantization matrices.
-
-    // Step 1: Split the block into channels
-    vector<cv::Mat> channels(3);
-    cv::split(block, channels); // Split the block into Y, Cr, and Cb channels
-
-    // Step 2: Determine the scale factor based on the quality factor
-    float scale = determineScale(quality);
-
-    // Step 3: Apply DCT to each channel separately and quantize
-    for (int c = 0; c < 3; ++c)
+    image.create(imageSize, CV_32FC3);
+    int blockSize = 8;
+    int currentBlock = 0;
+    for (int y = 0; y < imageSize.height; y += blockSize)
     {
-        cv::dct(channels[c], channels[c]); // Apply DCT to each channel separately
-
-        // Quantize the DCT coefficients
-        for (int i = 0; i < 8; ++i)
+        for (int x = 0; x < imageSize.width; x += blockSize)
         {
-            for (int j = 0; j < 8; ++j)
-            {
-                // Use the luminance quantization table for the Y channel (0) and the chrominance quantization table for Cb (1) and Cr (2) channels
-                int quantTable = (c == 0) ? LuminanceQuantizationTable[i][j] : ChrominanceQuantizationTable[i][j];
-                channels[c].at<float>(i, j) = round(channels[c].at<float>(i, j) / (quantTable * scale));
-            }
-        }
-    }
-
-    // Step 4: Merge the channels back into a single block
-    cv::merge(channels, block);
-}
-
-__host__ void deprocessBlock(cv::Mat &block, const int quality)
-{
-    // TODO : Implement the function to dequantize the block and apply inverse DCT to reconstruct the image.
-
-    // Calculate the same scale factor used during quantization
-    float scale = determineScale(quality);
-
-    // Step 1: Split the block into channels
-    vector<cv::Mat> channels(3);
-    cv::split(block, channels);
-
-    // Step 2: Dequantize and apply inverse DCT to each channel
-    for (int c = 0; c < 3; ++c)
-    {
-        // Dequantize
-        for (int i = 0; i < 8; ++i)
-        {
-            for (int j = 0; j < 8; ++j)
-            {
-                int quantTable = (c == 0) ? LuminanceQuantizationTable[i][j] : ChrominanceQuantizationTable[i][j];
-                channels[c].at<float>(i, j) *= (quantTable * scale); // Apply the same scale factor used in quantization
-            }
-        }
-
-        // Apply inverse DCT
-        cv::idct(channels[c], channels[c]);
-    }
-
-    // Step 3: Merge the channels back
-    cv::merge(channels, block);
-}
-
-__host__ void assembleBlocks(cv::Mat &image, const std::vector<cv::Mat> &blocks, const cv::Size &image_size)
-{
-    // TODO : Implement the function to reassemble the image from the blocks.
-    // The image should be of the same size as the original image, hence why we pass the image_size parameter.
-
-    // Calculate the padded dimensions that were used when splitting
-    int padded_height = image_size.height + (image_size.height % 8 == 0 ? 0 : 8 - image_size.height % 8);
-    int padded_width = image_size.width + (image_size.width % 8 == 0 ? 0 : 8 - image_size.width % 8);
-    cv::Size padded_size(padded_width, padded_height);
-
-    cout << "Original image size: " << image_size << endl;
-    cout << "Padded image size for reassembly: " << padded_size << endl;
-
-    // First create a padded image to match the dimensions used during splitting
-    cv::Mat padded_result(padded_size, CV_32FC3, cv::Scalar(0, 0, 0));
-
-    // Place blocks into the padded image
-    int index = 0;
-    for (int row = 0; row < padded_size.height; row += 8)
-    {
-        for (int col = 0; col < padded_size.width; col += 8)
-        {
-            if (index < blocks.size())
-            {
-                blocks[index++].copyTo(padded_result(cv::Rect(col, row, 8, 8)));
-            }
-        }
-    }
-
-    // Now crop the padded result to get the original image size
-    image = padded_result(cv::Rect(0, 0, image_size.width, image_size.height)).clone();
-}
-
-__host__ void compareImages(const char *originalImagePath, const char *reconstructedImagePath)
-{
-    // Get file sizes
-    FILE *f_orig = fopen(originalImagePath, "rb");
-    FILE *f_recon = fopen(reconstructedImagePath, "rb");
-
-    if (f_orig && f_recon)
-    {
-        // Get original file size
-        fseek(f_orig, 0, SEEK_END);
-        long orig_size = ftell(f_orig);
-
-        // Get reconstructed file size
-        fseek(f_recon, 0, SEEK_END);
-        long recon_size = ftell(f_recon);
-
-        // Close files
-        fclose(f_orig);
-        fclose(f_recon);
-
-        // Calculate compression ratio
-        double compression_ratio = static_cast<double>(orig_size) / recon_size;
-
-        // Print results
-        std::cout << "Original file size: " << orig_size << " bytes" << std::endl;
-        std::cout << "Reconstructed file size: " << recon_size << " bytes" << std::endl;
-        std::cout << "Compression ratio: " << compression_ratio << ":1" << std::endl;
-        std::cout << "Space saving: " << (1.0 - 1.0 / compression_ratio) * 100.0 << "%" << std::endl;
-    }
-    else
-    {
-        std::cerr << "Error opening files for size comparison" << std::endl;
-    }
-}
-
-__global__ void processBlocksKernel(float *d_input_blocks, float *d_output_blocks, int quality)
-{
-    // I first need to create a shared memory for the block to be processed and fill it with the data needed
-    __shared__ float block[8][8][3]; // 8x8 block with 3 channels (Y, Cb, Cr)
-
-    // Index to determine which block to process
-    // int inputBlockIndex = blockIdx.x * blockDim.x + threadIdx.x;
-    int inputBlockIndex = blockIdx.x;
-
-    // Each thread will load one pixel from the input blocks into shared memory
-    // Keep in mind that one pixel -> 3 channels, not only one channel.
-    for (int c = 0; c < 3; c++)
-    {
-        // Determine index of pixel inside the block
-        // First go to that specific block in the input blocks (inputBlockIndex * 8 * 8 * 3)
-        // Then go to the specific row (threadIdx.y * 8 * 3) and column (threadIdx.x * 3) of the block
-        // Finally go to the specific channel (c) of the pixel
-        int pixelIndex = inputBlockIndex * 8 * 8 * 3 + threadIdx.y * 8 * 3 + threadIdx.x * 3 + c;
-        // Check boundary condition
-        if (pixelIndex < 8 * 8 * 3 * gridDim.x) // Ensure we don't go out of bounds
-        {
-            // Load the pixel into shared memory
-            block[threadIdx.y][threadIdx.x][c] = d_input_blocks[pixelIndex];
-        }
-    }
-
-    __syncthreads(); // Synchronize threads to ensure all data is loaded into shared memory
-
-    // Now apply DCT and quantization to the block in shared memory
-    // Each thread is responsible for only one DCT coefficient, then quantize that coefficient and return the result to global memory
-
-    // First determine the scale that will be used for quantization
-    float scale = determineScale(quality);
-
-    // Then apply DCT using the equation dctCoeff = D * block * D'
-    for (int c = 0; c < 3; c++)
-    {
-        float dctCoeff = 0.0f;
-
-        for (int row = 0; row < 8; row++)
-        {
-            for (int col = 0; col < 8; col++)
-            {
-                dctCoeff += dctMatrix[threadIdx.y][row] * block[row][col][c] * idctMatrix[col][threadIdx.x];
-            }
-        }
-
-        // Quantize the DCT coefficient using the appropriate quantization table
-        int quantTable = (c == 0) ? LuminanceQuantizationTable[threadIdx.y][threadIdx.x] : ChrominanceQuantizationTable[threadIdx.y][threadIdx.x];
-        dctCoeff = round(dctCoeff / (quantTable * scale)); // Quantization step
-
-        // Store the result in global memory
-        // Calculate the index in the output blocks
-        int outputIndex = inputBlockIndex * 8 * 8 * 3 + threadIdx.y * 8 * 3 + threadIdx.x * 3 + c;
-        // Check boundary condition
-        if (outputIndex < 8 * 8 * 3 * gridDim.x) // Ensure we don't go out of bounds
-        {
-            d_output_blocks[outputIndex] = dctCoeff; // Store the quantized DCT coefficient in global memory
-        }
-    }
-}
-
-__global__ void deprocessBlocksKernel(float *d_input_blocks, float *d_output_blocks, int quality)
-{
-    // Create shared memory for the block to be processed
-    __shared__ float block[8][8][3]; // 8x8 block with 3 channels (Y, Cb, Cr)
-
-    // Index to determine which block to process
-    int blockIndex = blockIdx.x;
-
-    // Thread coordinates within the 8x8 block
-    int tx = threadIdx.x; // Column index (0-7)
-    int ty = threadIdx.y; // Row index (0-7)
-
-    // Load quantized DCT coefficients into shared memory
-    for (int c = 0; c < 3; c++)
-    {
-        // Calculate the index in the input array
-        int pixelIndex = blockIndex * 8 * 8 * 3 + (ty * 8 + tx) * 3 + c;
-        // Load the coefficient into shared memory
-        block[ty][tx][c] = d_input_blocks[pixelIndex];
-    }
-
-    __syncthreads(); // Ensure all threads have loaded their data
-
-    // Calculate scale factor for dequantization
-    float scale = determineScale(quality);
-
-    // Each thread computes one pixel value for each channel
-    for (int c = 0; c < 3; c++)
-    {
-        // First dequantize the DCT coefficient
-        int quantTable = (c == 0) ? LuminanceQuantizationTable[ty][tx] : ChrominanceQuantizationTable[ty][tx];
-        block[ty][tx][c] *= (quantTable * scale); // Dequantization step
-    }
-
-    __syncthreads(); // Ensure all coefficients are dequantized
-
-    // Now apply IDCT to get the pixel values
-    for (int c = 0; c < 3; c++)
-    {
-        // Compute pixel value using IDCT: pixel = T^T * DCT * T
-        float pixelValue = 0.0f;
-        
-        for (int u = 0; u < 8; u++)
-        {
-            for (int v = 0; v < 8; v++)
-            {
-                // For IDCT, we use idctMatrix (T^T) first, then dctMatrix (T)
-                // Note: In matrix multiplication for IDCT, the order is reversed compared to DCT
-                pixelValue += idctMatrix[ty][u] * block[u][v][c] * dctMatrix[v][tx];
-            }
-        }
-        
-        // Store the reconstructed pixel value in the output
-        int outputIndex = blockIndex * 8 * 8 * 3 + ty * 8 * 3 + tx * 3 + c;
-        // Check boundary condition
-        if (outputIndex < 8 * 8 * 3 * gridDim.x) // Ensure we don't go out of bounds
-        {
-            d_output_blocks[outputIndex] = pixelValue;
+            if (currentBlock >= blocks.size())
+                break;
+            cv::Rect roi(x, y, blockSize, blockSize);
+            cv::Mat block = blocks[currentBlock++];
+            if (roi.x + roi.width > imageSize.width)
+                roi.width = imageSize.width - roi.x;
+            if (roi.y + roi.height > imageSize.height)
+                roi.height = imageSize.height - roi.y;
+            block(cv::Rect(0, 0, roi.width, roi.height)).copyTo(image(roi));
         }
     }
 }
@@ -385,110 +579,104 @@ int main(int argc, char **argv)
         return -1;
     }
     const char *IMAGEPATH = argv[1];
-    const int quality = argc == 3 ? stoi(argv[2]) : 75; // Quality factor for quantization
+    const int quality = argc == 3 ? stoi(argv[2]) : 75;
 
-    // Move necessary data into constant memory
-    cudaMemcpyToSymbol(LuminanceQuantizationTable, h_LumTable, sizeof(LuminanceQuantizationTable));
-    cudaMemcpyToSymbol(ChrominanceQuantizationTable, h_ChromTable, sizeof(ChrominanceQuantizationTable));
-    cudaMemcpyToSymbol(dctMatrix, h_dctMatrix, sizeof(dctMatrix));
-    cudaMemcpyToSymbol(idctMatrix, h_idctMatrix, sizeof(idctMatrix));
-    gpuErrchk(cudaPeekAtLastError());
+    initializeGPUConstants();
+    GPUTimer timer;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    // Step 1: Read the image in RGB format
     cv::Mat image = cv::imread(IMAGEPATH, cv::IMREAD_COLOR);
     if (image.empty())
     {
         cerr << "Error: Could not read the image." << endl;
         return -1;
     }
-    cout << "Image size: " << image.size() << endl;
-    cout << "Image type: " << image.type() << endl;
+    cv::Mat ycbcr;
+    cv::cvtColor(image, ycbcr, cv::COLOR_BGR2YCrCb);
+    ycbcr.convertTo(ycbcr, CV_32FC3);
 
-    // Step 2: Convert the image to YCbCr color space
-    cv::Mat ycbcr_image;
-    cv::cvtColor(image, ycbcr_image, cv::COLOR_BGR2YCrCb);
+    vector<cv::Mat> blocks;
+    splitIntoBlocks(ycbcr, blocks);
+    int num_blocks = blocks.size();
 
-    // Step 3: Divide the image into 8*8 blocks
-    std::vector<cv::Mat> blocks;
-    splitIntoBlocks(ycbcr_image, blocks);
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, num_blocks * 8 * 8 * 3 * sizeof(float));
+    cudaMalloc(&d_output, num_blocks * 8 * 8 * 3 * sizeof(float));
 
-    // Step 4: Apply DCT to each block and quantize it using the given quantization matrix
-    // for (auto &block : blocks)
-    // processBlock(block, quality);
-    // ******************************************************************************
-    // Parallelize the processing of blocks using CUDA
-    // ******************************************************************************
-    // Allocate device memory for blocks
-    const int numOfBlocks = blocks.size();
-    const int blockSize = 8 * 8 * 3; // 8x8 blocks with 3 channels (Y, Cb, Cr)
-    float *d_input_blocks, *d_output_blocks;
-    cudaMalloc((void **)&d_input_blocks, numOfBlocks * blockSize * sizeof(float));
-    gpuErrchk(cudaPeekAtLastError());
-    cudaMalloc((void **)&d_output_blocks, numOfBlocks * blockSize * sizeof(float));
-    gpuErrchk(cudaPeekAtLastError());
-
-    // Copy blocks to device memory
-    for (int i = 0; i < numOfBlocks; ++i)
+    for (int i = 0; i < num_blocks; i++)
     {
-        cudaMemcpy(d_input_blocks + i * blockSize, (float *)blocks[i].data, blockSize * sizeof(float), cudaMemcpyHostToDevice);
-        gpuErrchk(cudaPeekAtLastError());
+        cudaMemcpy(d_input + i * 192, blocks[i].data, 192 * sizeof(float), cudaMemcpyHostToDevice);
     }
 
-    // Launch the kernel to process blocks in parallel
-    dim3 dimBlock(8, 8);
-    dim3 dimGrid(numOfBlocks);
-    processBlocksKernel<<<dimGrid, dimBlock>>>(d_input_blocks, d_output_blocks, quality);
-    gpuErrchk(cudaGetLastError());
-    cudaDeviceSynchronize();
+    GPUCompressedData compressed;
+    compressed.width = image.cols;
+    compressed.height = image.rows;
+    compressed.num_blocks = num_blocks;
+    cudaMalloc(&compressed.blocks, num_blocks * sizeof(GPURLEBlock));
 
-    // Now launch the inverse DCT kernel
-    // Note: We're using d_output_blocks as input and d_input_blocks as output
-    // This is just to reuse memory.
-    deprocessBlocksKernel<<<dimGrid, dimBlock>>>(d_output_blocks, d_input_blocks, quality);
-    gpuErrchk(cudaGetLastError());
-    cudaDeviceSynchronize();
-
-    // Copy the results back to host
-    for (int i = 0; i < numOfBlocks; ++i)
+    GPURLEBlock *h_blocks = new GPURLEBlock[num_blocks];
+    for (int i = 0; i < num_blocks; i++)
     {
-        cudaMemcpy((float *)blocks[i].data, d_input_blocks + i * blockSize, blockSize * sizeof(float), cudaMemcpyDeviceToHost);
-        gpuErrchk(cudaGetLastError());
+        cudaMalloc(&h_blocks[i].y_data, 128 * sizeof(int16_t));
+        cudaMalloc(&h_blocks[i].cb_data, 128 * sizeof(int16_t));
+        cudaMalloc(&h_blocks[i].cr_data, 128 * sizeof(int16_t));
     }
-    
-    // Free device memory
-    cudaFree(d_input_blocks);
-    cudaFree(d_output_blocks);
+    cudaMemcpy(compressed.blocks, h_blocks, num_blocks * sizeof(GPURLEBlock), cudaMemcpyHostToDevice);
+    delete[] h_blocks;
 
-    // *****************************************************************************
-    // End CUDA processing
-    // *****************************************************************************
+    cudaEventRecord(start);
+    gpuCompressKernel<<<num_blocks, dim3(8, 8)>>>(d_input, compressed, quality);
+    cudaEventRecord(stop);
+    float compress_time = timer.elapsed(start, stop);
 
+    saveCompressedData(compressed, "compressed.gpu");
 
-    // // Step 6: Reverse step 4: Dequantize the blocks and apply inverse DCT to reconstruct the image
-    // for (auto &block : blocks)
-    //     deprocessBlock(block, quality); // 75 is the quality factor for dequantization
+    cudaEventRecord(start);
+    gpuDecompressKernel<<<num_blocks, dim3(8, 8)>>>(d_output, compressed, quality);
+    cudaEventRecord(stop);
+    float decompress_time = timer.elapsed(start, stop);
 
-    // Step 7: Reassemble the image from the blocks
-    cv::Mat reconstructed_image;
-    assembleBlocks(reconstructed_image, blocks, image.size());
+    vector<cv::Mat> reconstructed(num_blocks);
+    for (int i = 0; i < num_blocks; i++)
+    {
+        reconstructed[i].create(8, 8, CV_32FC3);
+        cudaMemcpy(reconstructed[i].data, d_output + i * 192, 192 * sizeof(float), cudaMemcpyDeviceToHost);
+    }
 
-    // Show the original and reconstructed images
-    // cv::imshow("Original Image", image);
-    // Convert the reconstructed image back to BGR before displaying
-    cv::Mat reconstructed_bgr;
-    reconstructed_image.convertTo(reconstructed_bgr, CV_8UC3);
-    cv::cvtColor(reconstructed_bgr, reconstructed_bgr, cv::COLOR_YCrCb2BGR);
-    // cv::imshow("Reconstructed Image", reconstructed_bgr);
-    // cv::waitKey(0);
+    cv::Mat final_image;
+    assembleBlocks(final_image, reconstructed, image.size());
+    final_image.convertTo(final_image, CV_8UC3);
+    cv::cvtColor(final_image, final_image, cv::COLOR_YCrCb2BGR);
+    cv::imwrite("output.jpg", final_image);
 
-    // Save both images to disk
-    cv::imwrite("original.jpg", image);
-    cv::imwrite("reconstructed.jpg", reconstructed_bgr);
+    // Calculate stats PROPERLY
+    size_t original_raw_size = image.total() * image.elemSize(); // W*H*3 bytes
+    size_t compressed_size = getFileSize("compressed.gpu");
 
-    cout << "Original and reconstructed images saved." << endl;
+    cout << "=== Performance Results ===" << endl;
+    cout << "Compression time: " << compress_time << " ms" << endl;
+    cout << "Decompression time: " << decompress_time << " ms" << endl;
+    cout << "Original RAW size: " << original_raw_size << " bytes" << endl;
+    cout << "Compressed size: " << compressed_size << " bytes" << endl;
+    cout << "Compression ratio: " << (float)original_raw_size / compressed_size << ":1" << endl;
+    cout << "Space saving: "
+         << (1.0 - (double)compressed_size / original_raw_size) * 100.0 << "%" << endl;
 
-    // Step 8: Perform comparisons
-    compareImages("original.jpg", "reconstructed.jpg");
-    cout << "Comparison completed." << endl;
+    cudaFree(d_input);
+    cudaFree(d_output);
+    // Additional cleanup for compressed data
+    GPURLEBlock *h_cleanup = new GPURLEBlock[num_blocks];
+    cudaMemcpy(h_cleanup, compressed.blocks, num_blocks * sizeof(GPURLEBlock), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < num_blocks; i++)
+    {
+        cudaFree(h_cleanup[i].y_data);
+        cudaFree(h_cleanup[i].cb_data);
+        cudaFree(h_cleanup[i].cr_data);
+    }
+    delete[] h_cleanup;
+    cudaFree(compressed.blocks);
+
     return 0;
 }
