@@ -456,6 +456,8 @@ void assembleBlocks(cv::Mat &image, const vector<cv::Mat> &blocks, cv::Size imag
 
 int main(int argc, char **argv)
 {
+    auto total_start = std::chrono::high_resolution_clock::now();
+
     if (argc < 2 || argc > 3)
     {
         cerr << "Usage: " << argv[0] << " <image_path> [quality]" << endl;
@@ -560,6 +562,10 @@ int main(int argc, char **argv)
     }
     delete[] h_cleanup;
     cudaFree(compressed.blocks);
+
+    auto total_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> total_elapsed = total_end - total_start;
+    cout << "Total elapsed time (including all steps): " << total_elapsed.count() << " ms" << endl;
 
     return 0;
 }
