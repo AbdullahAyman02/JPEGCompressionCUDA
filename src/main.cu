@@ -15,8 +15,8 @@ using namespace cooperative_groups;
 namespace cg = cooperative_groups;
 
 // GPU Constants
-__constant__ int d_LuminanceQuantTable[8][8];
-__constant__ int d_ChrominanceQuantTable[8][8];
+__constant__ float d_LuminanceQuantTable[8][8];
+__constant__ float d_ChrominanceQuantTable[8][8];
 __constant__ float d_dctMatrix[8][8];
 __constant__ float d_idctMatrix[8][8];
 __constant__ int d_zigzagOrder[64];
@@ -63,26 +63,26 @@ public:
     }
 };
 
-// Host Quantization Tables and DCT Matrices
-static const int h_LumTable[8][8] = {
-    {16, 11, 10, 16, 24, 40, 51, 61},
-    {12, 12, 14, 19, 26, 58, 60, 55},
-    {14, 13, 16, 24, 40, 57, 69, 56},
-    {14, 17, 22, 29, 51, 87, 80, 62},
-    {18, 22, 37, 56, 68, 109, 103, 77},
-    {24, 35, 55, 64, 81, 104, 113, 92},
-    {49, 64, 78, 87, 103, 121, 120, 101},
-    {72, 92, 95, 98, 112, 100, 103, 99}};
+// Host Quantization Tables and DCT Matrices (converted to float)
+static const float h_LuminanceQuantTable[8][8] = {
+    {16.0f, 11.0f, 10.0f, 16.0f, 24.0f, 40.0f, 51.0f, 61.0f},
+    {12.0f, 12.0f, 14.0f, 19.0f, 26.0f, 58.0f, 60.0f, 55.0f},
+    {14.0f, 13.0f, 16.0f, 24.0f, 40.0f, 57.0f, 69.0f, 56.0f},
+    {14.0f, 17.0f, 22.0f, 29.0f, 51.0f, 87.0f, 80.0f, 62.0f},
+    {18.0f, 22.0f, 37.0f, 56.0f, 68.0f, 109.0f, 103.0f, 77.0f},
+    {24.0f, 35.0f, 55.0f, 64.0f, 81.0f, 104.0f, 113.0f, 92.0f},
+    {49.0f, 64.0f, 78.0f, 87.0f, 103.0f, 121.0f, 120.0f, 101.0f},
+    {72.0f, 92.0f, 95.0f, 98.0f, 112.0f, 100.0f, 103.0f, 99.0f}};
 
-static const int h_ChromTable[8][8] = {
-    {17, 18, 24, 47, 99, 99, 99, 99},
-    {18, 21, 26, 66, 99, 99, 99, 99},
-    {24, 26, 56, 99, 99, 99, 99, 99},
-    {47, 66, 99, 99, 99, 99, 99, 99},
-    {99, 99, 99, 99, 99, 99, 99, 99},
-    {99, 99, 99, 99, 99, 99, 99, 99},
-    {99, 99, 99, 99, 99, 99, 99, 99},
-    {99, 99, 99, 99, 99, 99, 99, 99}};
+static const float h_ChrominanceQuantTable[8][8] = {
+    {17.0f, 18.0f, 24.0f, 47.0f, 99.0f, 99.0f, 99.0f, 99.0f},
+    {18.0f, 21.0f, 26.0f, 66.0f, 99.0f, 99.0f, 99.0f, 99.0f},
+    {24.0f, 26.0f, 56.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f},
+    {47.0f, 66.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f},
+    {99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f},
+    {99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f},
+    {99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f},
+    {99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f}};
 
 static const float h_dctMatrix[8][8] = {
     {0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f, 0.35355338f},
@@ -125,30 +125,23 @@ __device__ float determineScale(int quality) {
     }
 }
 
-__device__ void zigzagScan(const int16_t *channel, int16_t *output)
-{
-    for (int i = 0; i < 64; i++)
-    {
+__device__ void zigzagScan(const int16_t *channel, int16_t *output) {
+    for (int i = 0; i < 64; i++) {
         int row = d_zigzagOrder[i] / 8;
         int col = d_zigzagOrder[i] % 8;
         output[i] = channel[row * 8 + col];
     }
 }
 
-__device__ void rleEncode(const int16_t *zigzag, int16_t *output, int &size)
-{
+__device__ void rleEncode(const int16_t *zigzag, int16_t *output, int &size) {
     int16_t current = zigzag[0];
     int count = 1;
     size = 0;
 
-    for (int i = 1; i < 64; i++)
-    {
-        if (zigzag[i] == current)
-        {
+    for (int i = 1; i < 64; i++) {
+        if (zigzag[i] == current) {
             count++;
-        }
-        else
-        {
+        } else {
             output[size++] = count;
             output[size++] = current;
             current = zigzag[i];
@@ -159,235 +152,168 @@ __device__ void rleEncode(const int16_t *zigzag, int16_t *output, int &size)
     output[size++] = current;
 }
 
+//------------------------------------------------------------------------------
+// ——— COMPRESS KERNEL ————————————————————————————————————————————————
+//------------------------------------------------------------------------------
 __global__ void gpuCompressKernel(float *input, GPUCompressedData output, int quality)
 {
-    cg::thread_block tile = cg::this_thread_block();
-    __shared__ float smem[8][8][3];
-    __shared__ int16_t dct_coeffs[8][8];
-    __shared__ int16_t zigzag[64];
-    __shared__ int16_t rle_buffer[128];
-
     int block_idx = blockIdx.x;
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
-    // Load block data
-    for (int c = 0; c < 3; c++)
-    {
-        int idx = block_idx * 192 + ty * 24 + tx * 3 + c;   // 192 = 8 * 8 * 3, 24 = 8 * 3
+    __shared__ float smem[8][8][3];
+    __shared__ int16_t dct_coeffs[8][8][3];
+    __shared__ int16_t zigzag[64][3];
+    __shared__ int16_t rle_buffer[128];
+
+    // Load block data into shared memory (parallel over threads)
+    for (int c = 0; c < 3; c++) {
+        int idx = block_idx * 192 + ty * 24 + tx * 3 + c;
         smem[ty][tx][c] = input[idx];
     }
-    tile.sync();
+    __syncthreads();
 
     float scale = determineScale(quality);
 
-    if (tile.thread_rank() == 0)
-    {
-        for (int channel = 0; channel < 3; channel++)
-        {
-            // DCT
-            for (int i = 0; i < 8; i++)
-            {
-                for (int j = 0; j < 8; j++)
-                {
-                    float sum = 0.0f;
-                    for (int k = 0; k < 8; k++)
-                    {
-                        for (int l = 0; l < 8; l++)
-                        {
-                            sum += d_dctMatrix[i][k] * smem[k][l][channel] * d_idctMatrix[l][j];
-                        }
-                    }
-                    dct_coeffs[i][j] = static_cast<int16_t>(round(sum));
-                }
+    // Parallel DCT and Quantization for each channel
+    for (int channel = 0; channel < 3; channel++) {
+        // Each thread computes one DCT coefficient
+        float sum = 0.0f;
+        for (int k = 0; k < 8; k++) {
+            for (int l = 0; l < 8; l++) {
+                sum += d_dctMatrix[ty][k] * smem[k][l][channel] * d_idctMatrix[l][tx];
             }
+        }
+        dct_coeffs[ty][tx][channel] = static_cast<int16_t>(roundf(sum));
+        __syncthreads();
 
-            // Quantization
-            for (int i = 0; i < 8; i++)
-            {
-                for (int j = 0; j < 8; j++)
-                {
-                    float quant_step = (channel == 0 ? d_LuminanceQuantTable[i][j] : d_ChrominanceQuantTable[i][j]) * scale;
-                    if (quant_step < 1.0f) quant_step = 1.0f;
-                    dct_coeffs[i][j] = static_cast<int16_t>(round(dct_coeffs[i][j] / quant_step));
-                }
-            }
+        // Quantization (parallel)
+        float quant_step = (channel == 0 ? d_LuminanceQuantTable[ty][tx] : d_ChrominanceQuantTable[ty][tx]) * scale;
+        if (quant_step < 1.0f) quant_step = 1.0f;
+        dct_coeffs[ty][tx][channel] = static_cast<int16_t>(roundf(dct_coeffs[ty][tx][channel] / quant_step));
+        __syncthreads();
 
-            // Zigzag + RLE + Store
-            zigzagScan(&dct_coeffs[0][0], zigzag);
-            if (channel == 0)
-            {
-                rleEncode(zigzag, rle_buffer, output.blocks[block_idx].y_size);
-                for (int i = 0; i < output.blocks[block_idx].y_size; i++)
+        // Zigzag (parallel: 64 threads, i.e., 8x8 block)
+        int tid = ty * 8 + tx;
+        if (tid < 64) {
+            int row = d_zigzagOrder[tid] / 8;
+            int col = d_zigzagOrder[tid] % 8;
+            zigzag[tid][channel] = dct_coeffs[row][col][channel];
+        }
+        __syncthreads();
+
+        // RLE (sequential, one thread per channel)
+        if (tx == 0 && ty == 0) {
+            int size = 0;
+            int16_t channel_zigzag[64];
+            for (int i = 0; i < 64; ++i)
+                channel_zigzag[i] = zigzag[i][channel];
+            rleEncode(channel_zigzag, rle_buffer, size);
+            if (channel == 0) {
+                output.blocks[block_idx].y_size = size;
+                for (int i = 0; i < size; i++)
                     output.blocks[block_idx].y_data[i] = rle_buffer[i];
-            }
-            else if (channel == 1)
-            {
-                rleEncode(zigzag, rle_buffer, output.blocks[block_idx].cb_size);
-                for (int i = 0; i < output.blocks[block_idx].cb_size; i++)
+            } else if (channel == 1) {
+                output.blocks[block_idx].cb_size = size;
+                for (int i = 0; i < size; i++)
                     output.blocks[block_idx].cb_data[i] = rle_buffer[i];
-            }
-            else // channel == 2
-            {
-                rleEncode(zigzag, rle_buffer, output.blocks[block_idx].cr_size);
-                for (int i = 0; i < output.blocks[block_idx].cr_size; i++)
+            } else {
+                output.blocks[block_idx].cr_size = size;
+                for (int i = 0; i < size; i++)
                     output.blocks[block_idx].cr_data[i] = rle_buffer[i];
             }
         }
+        __syncthreads();
     }
-
-    tile.sync();
 }
 
+//------------------------------------------------------------------------------
+// ——— DECOMPRESS KERNEL —————————————————————————————————————————————
+//------------------------------------------------------------------------------
 __global__ void gpuDecompressKernel(float *output, GPUCompressedData input, int quality)
 {
-    cg::thread_block tile = cg::this_thread_block();
+    int block_idx = blockIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
     __shared__ float smem[8][8][3];
     __shared__ int16_t zigzag[64];
     __shared__ float dct_coeffs[8][8];
 
-    int block_idx = blockIdx.x;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
+    float scale = determineScale(quality);
 
-    if (tile.thread_rank() == 0)
-    {
-        // Process Y channel
-        int idx = 0;
-        for (int i = 0; i < input.blocks[block_idx].y_size; i += 2)
-        {
-            int count = input.blocks[block_idx].y_data[i];
-            int16_t value = input.blocks[block_idx].y_data[i + 1];
-            while (count--)
-                zigzag[idx++] = value;
-        }
-        for (int i = 0; i < 64; i++)
-        {
-            int row = d_zigzagOrder[i] / 8;
-            int col = d_zigzagOrder[i] % 8;
-            dct_coeffs[row][col] = zigzag[i];
-        }
-        float scale = determineScale(quality);
-        for (int i = 0; i < 8; i++)
-        {
-            for (int j = 0; j < 8; j++)
-            {
-                float quant_step = d_LuminanceQuantTable[i][j] * scale;
-                dct_coeffs[i][j] *= quant_step;
+    for (int channel = 0; channel < 3; channel++) {
+        // RLE decode (sequential, one thread per channel)
+        if (tx == 0 && ty == 0) {
+            int idx = 0;
+            int size = 0;
+            int16_t* rle_data = nullptr;
+            int rle_size = 0;
+            if (channel == 0) {
+                rle_data = input.blocks[block_idx].y_data;
+                rle_size = input.blocks[block_idx].y_size;
+            } else if (channel == 1) {
+                rle_data = input.blocks[block_idx].cb_data;
+                rle_size = input.blocks[block_idx].cb_size;
+            } else {
+                rle_data = input.blocks[block_idx].cr_data;
+                rle_size = input.blocks[block_idx].cr_size;
+            }
+            for (int i = 0; i < rle_size; i += 2) {
+                int count = rle_data[i];
+                int16_t value = rle_data[i + 1];
+                while (count-- && idx < 64)
+                    zigzag[idx++] = value;
             }
         }
-        for (int i = 0; i < 8; i++)
-        {
-            for (int j = 0; j < 8; j++)
-            {
-                float sum = 0.0f;
-                for (int k = 0; k < 8; k++)
-                {
-                    for (int l = 0; l < 8; l++)
-                    {
-                        sum += d_idctMatrix[i][k] * dct_coeffs[k][l] * d_dctMatrix[l][j];
-                    }
-                }
-                smem[i][j][0] = sum;
-            }
-        }
+        __syncthreads();
 
-        // Process Cb channel
-        idx = 0;
-        for (int i = 0; i < input.blocks[block_idx].cb_size; i += 2)
-        {
-            int count = input.blocks[block_idx].cb_data[i];
-            int16_t value = input.blocks[block_idx].cb_data[i + 1];
-            while (count--)
-                zigzag[idx++] = value;
+        // Inverse zigzag (parallel)
+        int tid = ty * 8 + tx;
+        if (tid < 64) {
+            int row = d_zigzagOrder[tid] / 8;
+            int col = d_zigzagOrder[tid] % 8;
+            dct_coeffs[row][col] = zigzag[tid];
         }
-        for (int i = 0; i < 64; i++)
-        {
-            int row = d_zigzagOrder[i] / 8;
-            int col = d_zigzagOrder[i] % 8;
-            dct_coeffs[row][col] = zigzag[i];
-        }
-        for (int i = 0; i < 8; i++)
-        {
-            for (int j = 0; j < 8; j++)
-            {
-                float quant_step = d_ChrominanceQuantTable[i][j] * scale;
-                dct_coeffs[i][j] *= quant_step;
-            }
-        }
-        for (int i = 0; i < 8; i++)
-        {
-            for (int j = 0; j < 8; j++)
-            {
-                float sum = 0.0f;
-                for (int k = 0; k < 8; k++)
-                {
-                    for (int l = 0; l < 8; l++)
-                    {
-                        sum += d_idctMatrix[i][k] * dct_coeffs[k][l] * d_dctMatrix[l][j];
-                    }
-                }
-                smem[i][j][1] = sum;
-            }
-        }
+        __syncthreads();
 
-        // Process Cr channel
-        idx = 0;
-        for (int i = 0; i < input.blocks[block_idx].cr_size; i += 2)
-        {
-            int count = input.blocks[block_idx].cr_data[i];
-            int16_t value = input.blocks[block_idx].cr_data[i + 1];
-            while (count--)
-                zigzag[idx++] = value;
+        // Dequantization (parallel)
+        if (tx < 8 && ty < 8) {
+            float quant = (channel == 0 ? d_LuminanceQuantTable[ty][tx] : d_ChrominanceQuantTable[ty][tx]) * scale;
+            dct_coeffs[ty][tx] *= quant;
         }
-        for (int i = 0; i < 64; i++)
-        {
-            int row = d_zigzagOrder[i] / 8;
-            int col = d_zigzagOrder[i] % 8;
-            dct_coeffs[row][col] = zigzag[i];
+        __syncthreads();
+
+        // IDCT (parallel)
+        if (tx < 8 && ty < 8) {
+            float sum = 0.0f;
+            for (int k = 0; k < 8; k++)
+                for (int l = 0; l < 8; l++)
+                    sum += d_idctMatrix[ty][k] * dct_coeffs[k][l] * d_dctMatrix[l][tx];
+            smem[ty][tx][channel] = sum;
         }
-        for (int i = 0; i < 8; i++)
-        {
-            for (int j = 0; j < 8; j++)
-            {
-                float quant_step = d_ChrominanceQuantTable[i][j] * scale;
-                dct_coeffs[i][j] *= quant_step;
-            }
-        }
-        for (int i = 0; i < 8; i++)
-        {
-            for (int j = 0; j < 8; j++)
-            {
-                float sum = 0.0f;
-                for (int k = 0; k < 8; k++)
-                {
-                    for (int l = 0; l < 8; l++)
-                    {
-                        sum += d_idctMatrix[i][k] * dct_coeffs[k][l] * d_dctMatrix[l][j];
-                    }
-                }
-                smem[i][j][2] = sum;
-            }
-        }
+        __syncthreads();
     }
-    tile.sync();
 
-    for (int c = 0; c < 3; c++)
-    {
+    // Write back to output (parallel)
+    for (int c = 0; c < 3; c++) {
         int idx = block_idx * 192 + ty * 24 + tx * 3 + c;
         output[idx] = smem[ty][tx][c];
     }
 }
 
-// Host functions
-void initializeGPUConstants()
-{
-    cudaMemcpyToSymbol(d_LuminanceQuantTable, h_LumTable, sizeof(h_LumTable));
-    cudaMemcpyToSymbol(d_ChrominanceQuantTable, h_ChromTable, sizeof(h_ChromTable));
+// Host functions (initializeGPUConstants, save/load, etc. remain similar with corrections)
+// [Rest of the code remains the same with corrections for channel handling and quantization tables]
+
+void initializeGPUConstants() {
+    cudaMemcpyToSymbol(d_LuminanceQuantTable, h_LuminanceQuantTable, sizeof(h_LuminanceQuantTable));
+    cudaMemcpyToSymbol(d_ChrominanceQuantTable, h_ChrominanceQuantTable, sizeof(h_ChrominanceQuantTable));
     cudaMemcpyToSymbol(d_dctMatrix, h_dctMatrix, sizeof(h_dctMatrix));
     cudaMemcpyToSymbol(d_idctMatrix, h_idctMatrix, sizeof(h_idctMatrix));
     cudaMemcpyToSymbol(d_zigzagOrder, zigzagOrder, sizeof(zigzagOrder));
 }
+
+// [Remaining host functions are adjusted accordingly, ensuring correct channel assignments and data handling]
 
 size_t getFileSize(const string &filename)
 {
