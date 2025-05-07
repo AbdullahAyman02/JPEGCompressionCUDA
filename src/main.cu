@@ -490,11 +490,6 @@ int main(int argc, char **argv)
     cudaMalloc(&d_input, num_blocks * 8 * 8 * 3 * sizeof(float));
     cudaMalloc(&d_output, num_blocks * 8 * 8 * 3 * sizeof(float));
 
-    for (int i = 0; i < num_blocks; i++)
-    {
-        cudaMemcpy(d_input + i * 192, blocks[i].data, 192 * sizeof(float), cudaMemcpyHostToDevice);
-    }
-
     GPUCompressedData compressed;
     compressed.width = image.cols;
     compressed.height = image.rows;
@@ -511,24 +506,34 @@ int main(int argc, char **argv)
     cudaMemcpy(compressed.blocks, h_blocks, num_blocks * sizeof(GPURLEBlock), cudaMemcpyHostToDevice);
     delete[] h_blocks;
 
+    // --- GPU pipeline timing start ---
     cudaEventRecord(start);
+
+    // H2D: Copy input blocks to device
+    for (int i = 0; i < num_blocks; i++)
+    {
+        cudaMemcpy(d_input + i * 192, blocks[i].data, 192 * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    // Compression kernel
     gpuCompressKernel<<<num_blocks, dim3(8, 8)>>>(d_input, compressed, quality);
-    cudaEventRecord(stop);
-    float compress_time = timer.elapsed(start, stop);
 
-    saveCompressedData(compressed, "compressed.gpu");
-
-    cudaEventRecord(start);
+    // Decompression kernel
     gpuDecompressKernel<<<num_blocks, dim3(8, 8)>>>(d_output, compressed, quality);
-    cudaEventRecord(stop);
-    float decompress_time = timer.elapsed(start, stop);
 
+    // D2H: Copy output blocks back to host
     vector<cv::Mat> reconstructed(num_blocks);
     for (int i = 0; i < num_blocks; i++)
     {
         reconstructed[i].create(8, 8, CV_32FC3);
         cudaMemcpy(reconstructed[i].data, d_output + i * 192, 192 * sizeof(float), cudaMemcpyDeviceToHost);
     }
+
+    cudaEventRecord(stop);
+    float total_gpu_time = timer.elapsed(start, stop);
+    // --- GPU pipeline timing end ---
+
+    saveCompressedData(compressed, "compressed.gpu");
 
     cv::Mat final_image;
     assembleBlocks(final_image, reconstructed, image.size());
@@ -541,8 +546,7 @@ int main(int argc, char **argv)
     size_t compressed_size = getFileSize("compressed.gpu");
 
     cout << "=== Performance Results ===" << endl;
-    cout << "Compression time: " << compress_time << " ms" << endl;
-    cout << "Decompression time: " << decompress_time << " ms" << endl;
+    cout << "Total GPU pipeline time (H2D + compress + decompress + D2H): " << total_gpu_time << " ms" << endl;
     cout << "Original RAW size: " << original_raw_size << " bytes" << endl;
     cout << "Compressed size: " << compressed_size << " bytes" << endl;
     cout << "Compression ratio: " << (float)original_raw_size / compressed_size << ":1" << endl;
