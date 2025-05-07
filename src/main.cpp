@@ -8,8 +8,8 @@
 using namespace std;
 namespace fs = std::filesystem;
 
-const string IMAGEPATH = "../../src/images/slax.jfif";
-const int quality = 50; // Quality factor for quantization
+const string IMAGEPATH = "../../src/images/pexels.png";
+const int quality = 75; // Quality factor for quantization
 
 // Define the quantization tables for YCbCr color space
 // First the Chrominance Quantization Table, which is used to multiply the CbCr channel of the YCbCr image
@@ -555,6 +555,8 @@ vector<ProcessedBlock> loadCompressedData(const string &filename,
 
 int main(int argc, char **argv)
 {
+    auto total_start = std::chrono::high_resolution_clock::now();
+
     cv::Mat image = cv::imread(IMAGEPATH, cv::IMREAD_COLOR);
     if (image.empty())
     {
@@ -635,6 +637,10 @@ int main(int argc, char **argv)
          << (double)original_raw_size/compressed_size << ":1" << endl;
     cout << "Space saving: " 
          << (1.0 - (double)compressed_size/original_raw_size)*100.0 << "%" << endl;
+
+    auto total_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> total_elapsed = total_end - total_start;
+    cout << "Total elapsed time (including all steps): " << total_elapsed.count() << " ms" << endl;
 
     return 0;
 }
