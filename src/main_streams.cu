@@ -246,7 +246,6 @@ __global__ void gpuDecompressKernel(float *output, GPUCompressedData input, int 
         // RLE decode (sequential, one thread per channel)
         if (tx == 0 && ty == 0) {
             int idx = 0;
-            int size = 0;
             int16_t* rle_data = nullptr;
             int rle_size = 0;
             if (channel == 0) {
@@ -509,14 +508,15 @@ int main(int argc, char **argv)
         cudaMalloc(&d_output[s], nblocks * 192 * sizeof(float));
         cudaMalloc(&d_blocks[s], nblocks * sizeof(GPURLEBlock));
 
-        GPURLEBlock *h_blocks = new GPURLEBlock[nblocks];
+        GPURLEBlock *h_blocks;
+        cudaHostAlloc(&h_blocks, nblocks * sizeof(GPURLEBlock), cudaHostAllocDefault);
         for (int i = 0; i < nblocks; ++i) {
             cudaMalloc(&h_blocks[i].y_data, 128 * sizeof(int16_t));
             cudaMalloc(&h_blocks[i].cb_data, 128 * sizeof(int16_t));
             cudaMalloc(&h_blocks[i].cr_data, 128 * sizeof(int16_t));
         }
         cudaMemcpy(d_blocks[s], h_blocks, nblocks * sizeof(GPURLEBlock), cudaMemcpyHostToDevice);
-        delete[] h_blocks;
+        cudaFreeHost(h_blocks);
 
         compressed[s].width = image.cols;
         compressed[s].height = image.rows;
@@ -573,12 +573,13 @@ int main(int argc, char **argv)
         int end_block = std::min(start_block + blocks_per_stream, num_blocks);
         int nblocks = end_block - start_block;
         if (nblocks <= 0) continue;
-        GPURLEBlock *h_blocks = new GPURLEBlock[nblocks];
+        GPURLEBlock *h_blocks;
+        cudaHostAlloc(&h_blocks, nblocks * sizeof(GPURLEBlock), cudaHostAllocDefault);
         cudaMemcpy(h_blocks, d_blocks[s], nblocks * sizeof(GPURLEBlock), cudaMemcpyDeviceToHost);
         for (int i = 0; i < nblocks; ++i) {
             h_blocks_merged[start_block + i] = h_blocks[i];
         }
-        delete[] h_blocks;
+        cudaFreeHost(h_blocks);
     }
     cudaMemcpy(merged.blocks, h_blocks_merged, num_blocks * sizeof(GPURLEBlock), cudaMemcpyHostToDevice);
 
