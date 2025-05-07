@@ -498,7 +498,7 @@ int main(int argc, char **argv)
     GPUCompressedData compressed[NUM_STREAMS];
     GPURLEBlock *d_blocks[NUM_STREAMS];
 
-    // Allocate and copy input blocks per stream
+    // Allocate all device memory and GPURLEBlock arrays for all streams
     for (int s = 0; s < NUM_STREAMS; ++s) {
         int start_block = s * blocks_per_stream;
         int end_block = std::min(start_block + blocks_per_stream, num_blocks);
@@ -509,48 +509,58 @@ int main(int argc, char **argv)
         cudaMalloc(&d_output[s], nblocks * 192 * sizeof(float));
         cudaMalloc(&d_blocks[s], nblocks * sizeof(GPURLEBlock));
 
-        // Allocate GPURLEBlock arrays and their data pointers
         GPURLEBlock *h_blocks = new GPURLEBlock[nblocks];
         for (int i = 0; i < nblocks; ++i) {
             cudaMalloc(&h_blocks[i].y_data, 128 * sizeof(int16_t));
             cudaMalloc(&h_blocks[i].cb_data, 128 * sizeof(int16_t));
             cudaMalloc(&h_blocks[i].cr_data, 128 * sizeof(int16_t));
         }
-        cudaMemcpyAsync(d_blocks[s], h_blocks, nblocks * sizeof(GPURLEBlock), cudaMemcpyHostToDevice, streams[s]);
+        cudaMemcpy(d_blocks[s], h_blocks, nblocks * sizeof(GPURLEBlock), cudaMemcpyHostToDevice);
         delete[] h_blocks;
 
-        // Set up compressed struct for this stream
         compressed[s].width = image.cols;
         compressed[s].height = image.rows;
         compressed[s].num_blocks = nblocks;
         compressed[s].blocks = d_blocks[s];
-
-        // Copy input blocks for this stream
-        for (int i = 0; i < nblocks; ++i) {
-            cudaMemcpyAsync(d_input[s] + i * 192, blocks[start_block + i].data, 192 * sizeof(float), cudaMemcpyHostToDevice, streams[s]);
-        }
     }
+
+    vector<cv::Mat> reconstructed(num_blocks);
 
     cudaEventRecord(start);
 
-    // Launch compression kernels per stream
+    // Pipeline: for each stream, overlap H2D, compress, decompress, D2H
     for (int s = 0; s < NUM_STREAMS; ++s) {
         int start_block = s * blocks_per_stream;
         int end_block = std::min(start_block + blocks_per_stream, num_blocks);
         int nblocks = end_block - start_block;
         if (nblocks <= 0) continue;
+
+        // H2D: Copy input blocks for this stream
+        for (int i = 0; i < nblocks; ++i) {
+            cudaMemcpyAsync(d_input[s] + i * 192, blocks[start_block + i].data, 192 * sizeof(float), cudaMemcpyHostToDevice, streams[s]);
+        }
+
+        // Compression kernel
         gpuCompressKernel<<<nblocks, dim3(8, 8), 0, streams[s]>>>(d_input[s], compressed[s], quality);
+
+        // Decompression kernel
+        gpuDecompressKernel<<<nblocks, dim3(8, 8), 0, streams[s]>>>(d_output[s], compressed[s], quality);
+
+        // D2H: Copy output blocks for this stream
+        for (int i = 0; i < nblocks; ++i) {
+            reconstructed[start_block + i].create(8, 8, CV_32FC3);
+            cudaMemcpyAsync(reconstructed[start_block + i].data, d_output[s] + i * 192, 192 * sizeof(float), cudaMemcpyDeviceToHost, streams[s]);
+        }
     }
 
-    // Synchronize all streams after compression
-    for (int i = 0; i < NUM_STREAMS; ++i)
-        cudaStreamSynchronize(streams[i]);
+    // Synchronize all streams after all work is queued
+    for (int s = 0; s < NUM_STREAMS; ++s)
+        cudaStreamSynchronize(streams[s]);
 
     cudaEventRecord(stop);
-    float compress_time = timer.elapsed(start, stop);
+    float total_gpu_time = timer.elapsed(start, stop);
 
     // Merge compressed data for saving
-    // Allocate a single GPUCompressedData and GPURLEBlock array for all blocks
     GPUCompressedData merged;
     merged.width = image.cols;
     merged.height = image.rows;
@@ -558,7 +568,6 @@ int main(int argc, char **argv)
     cudaMalloc(&merged.blocks, num_blocks * sizeof(GPURLEBlock));
     GPURLEBlock *h_blocks_merged = new GPURLEBlock[num_blocks];
 
-    // Copy all GPURLEBlock structs from each stream's d_blocks to merged.blocks
     for (int s = 0; s < NUM_STREAMS; ++s) {
         int start_block = s * blocks_per_stream;
         int end_block = std::min(start_block + blocks_per_stream, num_blocks);
@@ -575,44 +584,12 @@ int main(int argc, char **argv)
 
     saveCompressedData(merged, "compressed.gpu");
 
-    cudaEventRecord(start);
-
-    // Launch decompression kernels per stream
+    // Cleanup device memory and streams
     for (int s = 0; s < NUM_STREAMS; ++s) {
         int start_block = s * blocks_per_stream;
         int end_block = std::min(start_block + blocks_per_stream, num_blocks);
         int nblocks = end_block - start_block;
         if (nblocks <= 0) continue;
-        gpuDecompressKernel<<<nblocks, dim3(8, 8), 0, streams[s]>>>(d_output[s], compressed[s], quality);
-    }
-
-    // Synchronize all streams after decompression and copy
-    for (int i = 0; i < NUM_STREAMS; ++i)
-        cudaStreamSynchronize(streams[i]);
-
-    cudaEventRecord(stop);
-    float decompress_time = timer.elapsed(start, stop);
-
-    // Copy results back in streams
-    vector<cv::Mat> reconstructed(num_blocks);
-    for (int s = 0; s < NUM_STREAMS; ++s) {
-        int start_block = s * blocks_per_stream;
-        int end_block = std::min(start_block + blocks_per_stream, num_blocks);
-        int nblocks = end_block - start_block;
-        if (nblocks <= 0) continue;
-        for (int i = 0; i < nblocks; ++i) {
-            reconstructed[start_block + i].create(8, 8, CV_32FC3);
-            cudaMemcpyAsync(reconstructed[start_block + i].data, d_output[s] + i * 192, 192 * sizeof(float), cudaMemcpyDeviceToHost, streams[s]);
-        }
-    }
-
-    // Destroy streams and free per-stream device memory
-    for (int s = 0; s < NUM_STREAMS; ++s) {
-        int start_block = s * blocks_per_stream;
-        int end_block = std::min(start_block + blocks_per_stream, num_blocks);
-        int nblocks = end_block - start_block;
-        if (nblocks <= 0) continue;
-        // Free GPURLEBlock device memory for each block in d_blocks[s]
         GPURLEBlock *h_cleanup = new GPURLEBlock[nblocks];
         cudaMemcpy(h_cleanup, d_blocks[s], nblocks * sizeof(GPURLEBlock), cudaMemcpyDeviceToHost);
         for (int i = 0; i < nblocks; ++i) {
@@ -626,7 +603,6 @@ int main(int argc, char **argv)
         cudaFree(d_output[s]);
         cudaStreamDestroy(streams[s]);
     }
-    // Free merged GPURLEBlock array
     delete[] h_blocks_merged;
     cudaFree(merged.blocks);
 
@@ -636,13 +612,12 @@ int main(int argc, char **argv)
     cv::cvtColor(final_image, final_image, cv::COLOR_YCrCb2BGR);
     cv::imwrite("output.jpg", final_image);
 
-    // Calculate stats PROPERLY
-    size_t original_raw_size = image.total() * image.elemSize(); // W*H*3 bytes
+    // Calculate stats
+    size_t original_raw_size = image.total() * image.elemSize();
     size_t compressed_size = getFileSize("compressed.gpu");
 
     cout << "=== Performance Results ===" << endl;
-    cout << "Compression time: " << compress_time << " ms" << endl;
-    cout << "Decompression time: " << decompress_time << " ms" << endl;
+    cout << "Total GPU pipeline time (H2D + compress + decompress + D2H): " << total_gpu_time << " ms" << endl;
     cout << "Original RAW size: " << original_raw_size << " bytes" << endl;
     cout << "Compressed size: " << compressed_size << " bytes" << endl;
     cout << "Compression ratio: " << (float)original_raw_size / compressed_size << ":1" << endl;
@@ -652,6 +627,6 @@ int main(int argc, char **argv)
     auto total_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> total_elapsed = total_end - total_start;
     cout << "Total elapsed time (including all steps): " << total_elapsed.count() << " ms" << endl;
-     
+
     return 0;
 }
